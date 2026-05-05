@@ -43,14 +43,19 @@ pub mod watcher;
 pub mod wrapper_model;
 
 pub use entry::{
-    gitignores_for_directory, matches_gitignores, path_passes_filters, should_ignore_git_path,
-    BuildTreeError, DirectoryEntry, Entry, FileId, FileMetadata,
+    BuildTreeError, DirectoryEntry, Entry, FileId, FileMetadata, gitignores_for_directory,
+    matches_gitignores, path_passes_filters, should_ignore_git_path,
 };
 
 // Re-export the local model's event under its original name for backward compatibility.
 pub use local_model::RepositoryMetadataEvent;
 
 pub use repository::Repository;
+#[cfg(feature = "local_fs")]
+pub use repository::{
+    list_linked_worktree_roots, list_sibling_worktree_roots, resolve_common_git_dir,
+    resolve_main_worktree_root,
+};
 pub use watcher::{DirectoryWatcher, RepositoryUpdate, TargetFile};
 
 #[cfg(not(target_family = "wasm"))]

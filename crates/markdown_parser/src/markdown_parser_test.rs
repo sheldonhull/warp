@@ -12,16 +12,84 @@ use super::*;
 
 // Simple transformer to make testing easier.
 fn test_parse_markdown(source: &str) -> Vec<FormattedTextLine> {
-    parse_all(source, |input| parse_markdown_internal(input, false))
+    parse_all(source, |input| {
+        parse_markdown_internal(input, false)
+            .map(|(rest, lines)| (rest, lines.into_iter().map(|(l, _)| l).collect()))
+    })
 }
 
 fn test_parse_markdown_with_gfm_tables(source: &str) -> Vec<FormattedTextLine> {
-    parse_all(source, |input| parse_markdown_internal(input, true))
+    parse_all(source, |input| {
+        parse_markdown_internal(input, true)
+            .map(|(rest, lines)| (rest, lines.into_iter().map(|(l, _)| l).collect()))
+    })
 }
 
 #[test]
 fn test_parse_empty() {
     assert_eq!(test_parse_markdown(""), vec![]);
+}
+
+#[test]
+fn test_source_lines_basic_paragraphs() {
+    // Three paragraphs separated by blank lines.
+    let source = "first\n\nsecond\n\nthird\n";
+    let (text, ranges) = parse_markdown_with_source_lines(source).expect("parse");
+    assert_eq!(text.lines.len(), ranges.len());
+    // Find ranges for the three Line entries.
+    let line_ranges: Vec<_> = text
+        .lines
+        .iter()
+        .zip(ranges.iter())
+        .filter(|(line, _)| matches!(line, FormattedTextLine::Line(_)))
+        .map(|(_, r)| r.clone())
+        .collect();
+    assert_eq!(line_ranges.len(), 3);
+    assert_eq!(line_ranges[0], 0..1, "first paragraph on source line 0");
+    assert_eq!(line_ranges[1], 2..3, "second paragraph on source line 2");
+    assert_eq!(line_ranges[2], 4..5, "third paragraph on source line 4");
+}
+
+#[test]
+fn test_source_lines_heading_then_paragraph() {
+    let source = "# Title\n\nbody text\n";
+    let (text, ranges) = parse_markdown_with_source_lines(source).expect("parse");
+    let entries: Vec<_> = text
+        .lines
+        .iter()
+        .zip(ranges.iter())
+        .filter(|(line, _)| {
+            matches!(
+                line,
+                FormattedTextLine::Heading(_) | FormattedTextLine::Line(_)
+            )
+        })
+        .collect();
+    assert_eq!(entries.len(), 2);
+    assert!(matches!(entries[0].0, FormattedTextLine::Heading(_)));
+    assert_eq!(entries[0].1, &(0..1), "heading on line 0");
+    assert!(matches!(entries[1].0, FormattedTextLine::Line(_)));
+    assert_eq!(entries[1].1, &(2..3), "paragraph on line 2");
+}
+
+#[test]
+fn test_source_lines_code_block_spans_multiple_lines() {
+    let source = "intro\n\n```rust\nfn x() {}\nlet y = 1;\n```\n\nafter\n";
+    let (text, ranges) = parse_markdown_with_source_lines(source).expect("parse");
+    let code_block_idx = text
+        .lines
+        .iter()
+        .position(|l| matches!(l, FormattedTextLine::CodeBlock(_)))
+        .expect("expected a code block");
+    let code_range = &ranges[code_block_idx];
+    // The code block fence opens on source line 2 ("```rust") and closes
+    // on source line 5 ("```"). Parser collapses the whole block to a
+    // multi-line range.
+    assert_eq!(code_range.start, 2, "code block starts on line 2");
+    assert!(
+        code_range.end > code_range.start + 1,
+        "code block must span multiple source lines, got {code_range:?}"
+    );
 }
 
 #[test]

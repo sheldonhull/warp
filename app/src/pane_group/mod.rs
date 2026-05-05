@@ -16,9 +16,9 @@ use crate::ai::document::ai_document_model::{AIDocumentId, AIDocumentModel, AIDo
 use crate::ai::execution_profiles::profiles::{AIExecutionProfilesModel, ClientProfileId};
 use crate::ai::llms::LLMId;
 use crate::ai::restored_conversations::RestoredAgentConversations;
+use crate::auth::AuthStateProvider;
 use crate::auth::auth_manager::AuthManager;
 use crate::auth::auth_view_modal::AuthViewVariant;
-use crate::auth::AuthStateProvider;
 use crate::cloud_object::Space;
 #[cfg(feature = "local_fs")]
 use crate::code::editor_management::CodeSource;
@@ -28,9 +28,9 @@ use crate::code_review::diff_state::DiffMode;
 use crate::env_vars::EnvVarCollectionType;
 use crate::notebooks::file::FileNotebookView;
 use crate::pane_group::focus_state::PaneGroupFocusEvent;
+use crate::pane_group::pane::ActionOrigin;
 use crate::pane_group::pane::get_started_pane::GetStartedPane;
 use crate::pane_group::pane::welcome_pane::WelcomePane;
-use crate::pane_group::pane::ActionOrigin;
 use crate::quit_warning::UnsavedStateSummary;
 #[cfg(target_family = "wasm")]
 use crate::server::cloud_objects::update_manager::UpdateManager;
@@ -61,7 +61,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{mpsc::SyncSender, Arc};
+use std::sync::{Arc, mpsc::SyncSender};
 
 use itertools::Itertools;
 use lazy_static::lazy_static;
@@ -69,7 +69,7 @@ use lazy_static::lazy_static;
 use markdown_parser::FormattedTextFragment;
 use parking_lot::FairMutex;
 use pathfinder_geometry::rect::RectF;
-use pathfinder_geometry::vector::{vec2f, Vector2F};
+use pathfinder_geometry::vector::{Vector2F, vec2f};
 use serde::{Deserialize, Serialize};
 use session_sharing_protocol::common::{
     ParticipantId, Role, RoleRequestId, RoleRequestRejectedReason, RoleRequestResponse, SessionId,
@@ -79,12 +79,12 @@ use typed_path::TypedPath;
 use url::Url;
 use uuid::Uuid;
 use warp_cli::agent::Harness;
+use warp_core::HostId;
 use warp_core::command::ExitCode;
 use warp_core::context_flag::ContextFlag;
-use warp_core::HostId;
-use warp_util::path::convert_wsl_to_windows_host_path;
 #[cfg(feature = "local_fs")]
 use warp_util::path::LineAndColumnArg;
+use warp_util::path::convert_wsl_to_windows_host_path;
 use warpui::elements::{
     Clipped, CrossAxisAlignment, DispatchEventResult, EventHandler, Flex, MainAxisSize, Shrinkable,
     Stack,
@@ -94,8 +94,8 @@ use warpui::notification::NotificationSendError;
 
 use warpui::windowing::WindowManager;
 use warpui::{
-    elements::{ChildView, Element, ParentElement},
     AppContext, Entity, EntityId, ModelHandle, TypedActionView, View, ViewHandle, WindowId,
+    elements::{ChildView, Element, ParentElement},
 };
 use warpui::{SingletonEntity, ViewContext};
 
@@ -119,7 +119,7 @@ use crate::launch_configs::launch_config::{self, PaneMode, PaneTemplateType};
 use crate::persistence::ModelEvent;
 use crate::report_if_error;
 use crate::resource_center::{
-    mark_feature_used_and_write_to_user_defaults, Tip, TipAction, TipsCompleted,
+    Tip, TipAction, TipsCompleted, mark_feature_used_and_write_to_user_defaults,
 };
 use crate::server::ids::{ObjectUid, SyncId};
 use crate::server::telemetry::{
@@ -152,7 +152,7 @@ use session_sharing_protocol::sharer::SessionSourceType;
 use settings::Setting as _;
 
 use crate::code::active_file::ActiveFileModel;
-use crate::util::bindings::{is_binding_pty_compliant, CustomAction};
+use crate::util::bindings::{CustomAction, is_binding_pty_compliant};
 use crate::workflows::{WorkflowSelectionSource, WorkflowSource, WorkflowType};
 
 use crate::palette::PaletteMode;
@@ -170,7 +170,7 @@ pub mod focus_state;
 pub mod pane;
 pub mod tree;
 pub mod working_directories;
-use child_agent::{apply_hidden_child_agent_task_context, HiddenChildAgentTaskContext};
+use child_agent::{HiddenChildAgentTaskContext, apply_hidden_child_agent_task_context};
 
 use focus_state::PaneGroupFocusState;
 
@@ -179,6 +179,8 @@ use focus_state::PaneGroupFocusState;
 mod tests;
 
 pub use crate::code_review::CodeReviewPanelArg;
+pub use pane::PaneHeaderAction;
+pub use pane::PaneHeaderCustomAction;
 pub use pane::ai_document_pane::AIDocumentPane;
 pub use pane::ai_fact_pane::AIFactPane;
 pub use pane::code_diff_pane::CodeDiffPane;
@@ -192,8 +194,6 @@ pub use pane::notebook_pane::NotebookPane;
 pub use pane::settings_pane::SettingsPane;
 pub use pane::terminal_pane::TerminalPane;
 pub use pane::workflow_pane::WorkflowPane;
-pub use pane::PaneHeaderAction;
-pub use pane::PaneHeaderCustomAction;
 pub use pane::{
     AnyPaneContent, BackingView, PaneConfiguration, PaneConfigurationEvent, PaneContent, PaneEvent,
     PaneId, PaneView, TerminalPaneId,
@@ -5533,9 +5533,11 @@ impl PaneGroup {
                     });
 
                 GeneralSettings::handle(ctx).update(ctx, |general_settings, ctx| {
-                    report_if_error!(general_settings
-                        .user_default_shell_unsupported_banner_state
-                        .set_value(BannerState::Dismissed, ctx));
+                    report_if_error!(
+                        general_settings
+                            .user_default_shell_unsupported_banner_state
+                            .set_value(BannerState::Dismissed, ctx)
+                    );
                 });
             }
             BannerEvent::Action(_) => {
@@ -6402,6 +6404,59 @@ impl PaneGroup {
     /// focused pane, if a non-terminal pane is focused.
     pub fn active_session_view(&self, ctx: &AppContext) -> Option<ViewHandle<TerminalView>> {
         self.terminal_view_from_pane_id(self.active_session_id(ctx)?, ctx)
+    }
+
+    /// Routes a markdown selection from a `FileNotebookView` to the active
+    /// terminal/agent. Builds an "<path> L<start>-L<end>" prompt (or the
+    /// inline single-line variant) and sends it via the same transport the
+    /// code-review surface uses.
+    #[cfg(feature = "local_fs")]
+    pub fn send_markdown_selection_to_agent(
+        &self,
+        file_path: PathBuf,
+        line_range: Option<std::ops::RangeInclusive<usize>>,
+        selected_text: String,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        use crate::terminal::cli_agent::{
+            build_selection_line_range_prompt, build_selection_substring_prompt,
+        };
+        let Some(terminal_view) = self.active_session_view(ctx) else {
+            return;
+        };
+        let path_display = file_path.display().to_string();
+        let prompt = match &line_range {
+            Some(range) if range.start() == range.end() => {
+                build_selection_substring_prompt(&path_display, *range.start(), &selected_text)
+            }
+            Some(range) => {
+                build_selection_line_range_prompt(&path_display, *range.start(), *range.end())
+            }
+            None => format!("{path_display}: {selected_text}"),
+        };
+        terminal_view.update(ctx, |tv, ctx| {
+            // Returns Some(routing) when the prompt was delivered to a CLI
+            // agent or rich input. If None, fall back to appending a brief
+            // location reference to the terminal input buffer (mirrors the
+            // code-review behavior at code_review_view.rs:6097).
+            if tv
+                .try_send_text_to_cli_agent_or_rich_input(prompt, ctx)
+                .is_some()
+            {
+                return;
+            }
+            let location = match &line_range {
+                Some(range) if range.start() == range.end() => {
+                    format!("{path_display}:{} ", range.start())
+                }
+                Some(range) => format!("{path_display}:{}-{} ", range.start(), range.end()),
+                None => format!("{path_display} "),
+            };
+            tv.input().update(ctx, |input, ctx| {
+                input.append_to_buffer(&location, ctx);
+                input.ensure_agent_mode_for_ai_features(true, ctx);
+            });
+        });
     }
 
     /// The terminal view backing the _focused_ terminal session. This will be the same

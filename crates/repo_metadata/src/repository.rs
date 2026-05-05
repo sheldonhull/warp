@@ -5,25 +5,25 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(feature = "local_fs")]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use futures::future::ready;
 #[cfg(feature = "local_fs")]
 use ignore::gitignore::Gitignore;
 use warp_util::standardized_path::StandardizedPath;
-use warpui::r#async::{BoxFuture, SpawnedFutureHandle};
 #[cfg(feature = "local_fs")]
 use warpui::SingletonEntity;
+use warpui::r#async::{BoxFuture, SpawnedFutureHandle};
 use warpui::{Entity, ModelContext, ModelHandle};
 
 #[cfg(feature = "local_fs")]
 use crate::watcher::DirectoryWatcher;
+use crate::{RepoMetadataError, RepositoryUpdate, watcher::TaskQueue};
 #[cfg(feature = "local_fs")]
 use crate::{
     entry::{matches_gitignores, should_ignore_git_path},
     gitignores_for_directory,
 };
-use crate::{watcher::TaskQueue, RepoMetadataError, RepositoryUpdate};
 
 /// Trait for entities that want to subscribe to repository file changes.
 pub trait RepositorySubscriber: Send + Sync {
@@ -325,6 +325,134 @@ impl Repository {
     }
 }
 
+/// Resolves the shared `.git` directory for a working tree root.
+///
+/// Handles three cases:
+/// - `<root>/.git` is a directory (regular repo) → returns `<root>/.git`.
+/// - `<root>/.git` is a file containing `gitdir: <path>` (linked worktree)
+///   → resolves the gitdir and walks ancestors to find the `.git` component
+///   shared by all worktrees of the same repo.
+/// - Anything else → returns `None`.
+#[cfg(feature = "local_fs")]
+pub fn resolve_common_git_dir(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    let metadata = std::fs::metadata(&dot_git).ok()?;
+    if metadata.is_dir() {
+        return Some(dot_git);
+    }
+    if !metadata.is_file() {
+        return None;
+    }
+    let contents = std::fs::read_to_string(&dot_git).ok()?;
+    let trimmed = contents.trim();
+    let gitdir = trimmed.strip_prefix("gitdir:")?.trim();
+    let gitdir_path = if Path::new(gitdir).is_absolute() {
+        PathBuf::from(gitdir)
+    } else {
+        root.join(gitdir)
+    };
+    // Walk ancestors of the per-worktree gitdir to find the shared `.git`.
+    for ancestor in gitdir_path.ancestors() {
+        if ancestor.file_name().and_then(|n| n.to_str()) == Some(".git") {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
+}
+
+/// Resolves the working-tree root of the main worktree given the shared
+/// `.git` directory. The main worktree root is the parent of `<common>/.git`
+/// when `common` ends in `.git`. Bare repos (no working tree) return `None`.
+#[cfg(feature = "local_fs")]
+pub fn resolve_main_worktree_root(common_git_dir: &Path) -> Option<PathBuf> {
+    if common_git_dir.file_name().and_then(|n| n.to_str()) != Some(".git") {
+        return None;
+    }
+    let parent = common_git_dir.parent()?;
+    if parent.is_dir() {
+        Some(parent.to_path_buf())
+    } else {
+        None
+    }
+}
+
+/// Enumerates the working-tree roots of all linked worktrees registered under
+/// the given shared `.git` directory.
+///
+/// Reads `<common_git_dir>/worktrees/<name>/gitdir` for each linked worktree.
+/// The `gitdir` file contains the path to the worktree's `.git` *file*; the
+/// working-tree root is the parent of that path.
+///
+/// Skips entries whose working-tree directory no longer exists on disk
+/// (prunable worktrees) and entries that fail to parse. Returns an empty
+/// vector for bare repos and repos with no linked worktrees. Does **not**
+/// include the main worktree root — use [`resolve_main_worktree_root`] for
+/// that.
+#[cfg(feature = "local_fs")]
+pub fn list_linked_worktree_roots(common_git_dir: &Path) -> Vec<PathBuf> {
+    let worktrees_dir = common_git_dir.join("worktrees");
+    let Ok(entries) = std::fs::read_dir(&worktrees_dir) else {
+        return Vec::new();
+    };
+    let mut roots = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let gitdir_file = path.join("gitdir");
+        let Ok(contents) = std::fs::read_to_string(&gitdir_file) else {
+            continue;
+        };
+        // The gitdir file contains the absolute path to the worktree's `.git`
+        // file (e.g. `/home/user/repo-feat/.git`). The working-tree root is
+        // the parent of that path.
+        let raw = contents.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let gitfile_path = PathBuf::from(raw);
+        let Some(root) = gitfile_path.parent() else {
+            continue;
+        };
+        if !root.is_dir() {
+            // Prunable: working tree directory is gone.
+            continue;
+        }
+        roots.push(root.to_path_buf());
+    }
+    roots
+}
+
+/// Returns the working-tree roots of the main worktree plus all linked
+/// worktrees rooted at the shared `.git` directory derived from `repo_root`.
+///
+/// `repo_root` itself is always included (deduplicated). Returns an empty
+/// vector if the path is not a git working tree or its `.git` cannot be
+/// resolved.
+#[cfg(feature = "local_fs")]
+pub fn list_sibling_worktree_roots(repo_root: &Path) -> Vec<PathBuf> {
+    let Some(common) = resolve_common_git_dir(repo_root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Some(main) = resolve_main_worktree_root(&common) {
+        out.push(main);
+    }
+    out.extend(list_linked_worktree_roots(&common));
+    // Always include repo_root itself so callers don't need to special-case it.
+    let canonical_input =
+        std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    if !out.iter().any(|p| {
+        std::fs::canonicalize(p)
+            .map(|c| c == canonical_input)
+            .unwrap_or(false)
+    }) {
+        out.push(canonical_input);
+    }
+    out
+}
+
 impl Entity for Repository {
     type Event = ();
 }
@@ -507,3 +635,7 @@ where
         }
     }
 }
+
+#[cfg(all(test, feature = "local_fs"))]
+#[path = "repository_test.rs"]
+mod tests;

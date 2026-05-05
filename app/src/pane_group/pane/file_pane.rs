@@ -13,8 +13,8 @@ use crate::{
 };
 
 use super::{
-    notebook_pane::subscribe_to_link_model, view::PaneView, DetachType, PaneConfiguration,
-    PaneContent, PaneGroup, PaneId, ShareableLink, ShareableLinkError,
+    DetachType, PaneConfiguration, PaneContent, PaneGroup, PaneId, ShareableLink,
+    ShareableLinkError, notebook_pane::subscribe_to_link_model, view::PaneView,
 };
 
 pub struct FilePane {
@@ -126,6 +126,19 @@ impl PaneContent for FilePane {
                 }
                 FileNotebookEvent::Pane(pane_event) => {
                     pane_group.handle_pane_event(pane_id, pane_event, ctx)
+                }
+                #[cfg(feature = "local_fs")]
+                FileNotebookEvent::SendSelectionToAgent {
+                    file_path,
+                    line_range,
+                    selected_text,
+                } => {
+                    pane_group.send_markdown_selection_to_agent(
+                        file_path.clone(),
+                        line_range.clone(),
+                        selected_text.clone(),
+                        ctx,
+                    );
                 }
             },
         );

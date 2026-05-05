@@ -3,27 +3,27 @@ use crate::code_review::code_review_header::HEADER_BUTTON_PADDING;
 #[cfg(feature = "local_fs")]
 use crate::code_review::code_review_view::CodeReviewAction;
 use crate::code_review::code_review_view::{
-    render_file_navigation_button, CodeReviewView, CONTENT_LEFT_MARGIN, CONTENT_RIGHT_MARGIN,
+    CONTENT_LEFT_MARGIN, CONTENT_RIGHT_MARGIN, CodeReviewView, render_file_navigation_button,
 };
 use crate::code_review::code_review_view::{CodeReviewCommentDebugState, CodeReviewViewEvent};
 use crate::code_review::telemetry_event::CodeReviewContextDestination;
-use crate::pane_group::pane::view::header::{components::HEADER_EDGE_PADDING, PANE_HEADER_HEIGHT};
 use crate::pane_group::WorkingDirectoriesEvent;
+use crate::pane_group::pane::view::header::{PANE_HEADER_HEIGHT, components::HEADER_EDGE_PADDING};
 use crate::pane_group::{Event as PaneGroupEvent, PaneGroup, WorkingDirectoriesModel};
 use crate::settings::{AISettings, AISettingsChangedEvent};
+use crate::terminal::CLIAgent;
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::input::MenuPositioning;
-use crate::terminal::CLIAgent;
 use crate::ui_components::{buttons::icon_button_with_color, icons};
-use crate::util::bindings::{keybinding_name_to_display_string, CustomAction};
+use crate::util::bindings::{CustomAction, keybinding_name_to_display_string};
 #[cfg(feature = "local_fs")]
 use crate::util::openable_file_type::FileTarget;
 use crate::view_components::action_button::{ActionButton, PaneHeaderTheme};
 #[cfg(feature = "local_fs")]
 use crate::view_components::action_button::{NakedTheme, TooltipAlignment};
 use crate::view_components::{Dropdown, DropdownItem};
-use crate::workspace::view::TOGGLE_RIGHT_PANEL_BINDING_NAME;
 use crate::workspace::WorkspaceAction;
+use crate::workspace::view::TOGGLE_RIGHT_PANEL_BINDING_NAME;
 use crate::{
     appearance::Appearance,
     drive::panel::{MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH},
@@ -39,16 +39,16 @@ use std::{
 use warp_core::features::FeatureFlag;
 use warp_core::ui::Icon;
 use warp_util::path::LineAndColumnArg;
+use warpui::EntityId;
 use warpui::elements::{ChildAnchor, Empty, PositionedElementAnchor};
 use warpui::keymap::EditableBinding;
-use warpui::EntityId;
 use warpui::{
-    elements::{
-        resizable_state_handle, Container, DragBarSide, Element, MainAxisSize, MouseStateHandle,
-        Resizable, ResizableStateHandle,
-    },
     AppContext, Entity, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
     ViewHandle, WeakViewHandle,
+    elements::{
+        Container, DragBarSide, Element, MainAxisSize, MouseStateHandle, Resizable,
+        ResizableStateHandle, resizable_state_handle,
+    },
 };
 use warpui::{
     elements::{
@@ -119,6 +119,46 @@ impl ReviewTerminalStatus {
     }
 }
 
+/// Expands a list of repo roots to include each repo's sibling worktrees
+/// (the main worktree plus any `git worktree`-linked siblings sharing the
+/// same `.git` directory). Preserves insertion order, deduplicates by
+/// `PathBuf`, and is a no-op for non-git directories.
+#[cfg(feature = "local_fs")]
+fn expand_with_sibling_worktrees(repos: &[PathBuf]) -> Vec<PathBuf> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for repo in repos {
+        // Always include the original input first so the existing repo's
+        // ordering / index is preserved.
+        if seen.insert(repo.clone()) {
+            out.push(repo.clone());
+        }
+        for sibling in repo_metadata::list_sibling_worktree_roots(repo) {
+            // `list_sibling_worktree_roots` returns canonical paths; compare
+            // canonically to avoid splitting the same logical worktree across
+            // entries that differ only in symlink resolution.
+            let canonical_sibling = std::fs::canonicalize(&sibling).unwrap_or(sibling.clone());
+            // Skip if any already-emitted path canonicalizes to the same target.
+            let already_present = out.iter().any(|existing| {
+                std::fs::canonicalize(existing)
+                    .map(|c| c == canonical_sibling)
+                    .unwrap_or(false)
+            });
+            if !already_present && seen.insert(canonical_sibling.clone()) {
+                out.push(canonical_sibling);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(feature = "local_fs"))]
+#[allow(dead_code)]
+fn expand_with_sibling_worktrees(repos: &[PathBuf]) -> Vec<PathBuf> {
+    repos.to_vec()
+}
+
 struct CodeReviewState {
     dropdown: ViewHandle<Dropdown<RightPanelAction>>,
     available_repos: Vec<PathBuf>,
@@ -176,23 +216,29 @@ impl CodeReviewState {
     }
 
     #[cfg(feature = "local_fs")]
-    fn set_available_repos(&mut self, repos: Vec<PathBuf>, ctx: &mut ViewContext<RightPanelView>) {
+    fn set_available_repos(
+        &mut self,
+        repos: Vec<PathBuf>,
+        working_directories_model: &ModelHandle<WorkingDirectoriesModel>,
+        ctx: &mut ViewContext<RightPanelView>,
+    ) {
+        let expanded = expand_with_sibling_worktrees(&repos);
         let should_clear = self
             .selected_repo_path
             .as_ref()
-            .map(|p| !repos.contains(p))
+            .map(|p| !expanded.contains(p))
             .unwrap_or(false);
         if should_clear {
             self.selected_repo_path = None;
         }
-        self.available_repos = repos;
+        self.available_repos = expanded;
 
-        self.update_repo_dropdown(ctx);
+        self.update_repo_dropdown(working_directories_model, ctx);
 
         // Auto-select first repo if we have one and no selection yet
         if self.selected_repo_path.is_none() {
             if let Some(first_repo) = self.available_repos.first() {
-                self.set_selected_repo(first_repo.clone(), ctx);
+                self.set_selected_repo(first_repo.clone(), working_directories_model, ctx);
             }
         }
     }
@@ -201,13 +247,19 @@ impl CodeReviewState {
     pub fn set_selected_repo(
         &mut self,
         _repo_path: PathBuf,
+        _working_directories_model: &ModelHandle<WorkingDirectoriesModel>,
         _ctx: &mut ViewContext<RightPanelView>,
     ) {
     }
 
     #[cfg(feature = "local_fs")]
-    pub fn set_selected_repo(&mut self, repo_path: PathBuf, ctx: &mut ViewContext<RightPanelView>) {
-        self.set_selected_repo_internal(repo_path, true, ctx);
+    pub fn set_selected_repo(
+        &mut self,
+        repo_path: PathBuf,
+        working_directories_model: &ModelHandle<WorkingDirectoriesModel>,
+        ctx: &mut ViewContext<RightPanelView>,
+    ) {
+        self.set_selected_repo_internal(repo_path, true, working_directories_model, ctx);
     }
 
     pub fn set_focused_repo(
@@ -228,6 +280,7 @@ impl CodeReviewState {
         &mut self,
         repo_path: PathBuf,
         update_dropdown: bool,
+        working_directories_model: &ModelHandle<WorkingDirectoriesModel>,
         ctx: &mut ViewContext<RightPanelView>,
     ) {
         if self.selected_repo_path.as_ref() == Some(&repo_path) {
@@ -239,7 +292,7 @@ impl CodeReviewState {
 
         // Only update the dropdown if requested (not when selection came from dropdown itself)
         if update_dropdown {
-            self.update_repo_dropdown(ctx);
+            self.update_repo_dropdown(working_directories_model, ctx);
         }
 
         ctx.notify();
@@ -253,14 +306,50 @@ impl CodeReviewState {
             .map(|name| name.to_string())
     }
 
+    /// Returns `<dir_name> [<branch>]` when a `DiffStateModel` for `repo_path`
+    /// has resolved a branch name, otherwise just `<dir_name>`. Used to
+    /// disambiguate sibling worktrees of the same repo (which have different
+    /// directory names) and to show the active branch at a glance.
+    #[cfg(feature = "local_fs")]
+    fn get_repo_display_name_with_branch(
+        &self,
+        repo_path: &Path,
+        working_directories_model: &ModelHandle<WorkingDirectoriesModel>,
+        ctx: &AppContext,
+    ) -> Option<String> {
+        let dir_name = self.get_repo_display_name(repo_path)?;
+        let branch = working_directories_model
+            .as_ref(ctx)
+            .get_existing_diff_state_model(repo_path)
+            .and_then(|m| m.as_ref(ctx).get_current_branch_name());
+        Some(match branch {
+            Some(b) if b == "HEAD" => format!("{dir_name} [detached HEAD]"),
+            Some(b) => format!("{dir_name} [{b}]"),
+            None => dir_name,
+        })
+    }
+
     #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
-    fn update_repo_dropdown(&mut self, ctx: &mut ViewContext<RightPanelView>) {
+    fn update_repo_dropdown(
+        &mut self,
+        working_directories_model: &ModelHandle<WorkingDirectoriesModel>,
+        ctx: &mut ViewContext<RightPanelView>,
+    ) {
         // Collect data before borrowing mutably
         let (items, selected_display_name) = {
             let items: Vec<DropdownItem<RightPanelAction>> = self
                 .available_repos
                 .iter()
                 .map(|repo_path| {
+                    #[cfg(feature = "local_fs")]
+                    let display_name = self
+                        .get_repo_display_name_with_branch(
+                            repo_path,
+                            working_directories_model,
+                            ctx,
+                        )
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    #[cfg(not(feature = "local_fs"))]
                     let display_name = self
                         .get_repo_display_name(repo_path)
                         .unwrap_or_else(|| "Unknown".to_string());
@@ -274,10 +363,17 @@ impl CodeReviewState {
                 })
                 .collect();
 
-            let selected_display_name = self
-                .selected_repo_path
-                .as_ref()
-                .and_then(|selected| self.get_repo_display_name(selected));
+            let selected_display_name = self.selected_repo_path.as_ref().and_then(|selected| {
+                #[cfg(feature = "local_fs")]
+                {
+                    self.get_repo_display_name_with_branch(selected, working_directories_model, ctx)
+                }
+                #[cfg(not(feature = "local_fs"))]
+                {
+                    let _ = working_directories_model;
+                    self.get_repo_display_name(selected)
+                }
+            });
 
             (items, selected_display_name)
         };
@@ -502,8 +598,9 @@ impl RightPanelView {
                     .as_ref()
                     .and_then(|s| s.selected_repo_path.clone());
 
+                let wd_model = self.working_directories_model.clone();
                 if let Some(state) = self.code_review_state.as_mut() {
-                    state.set_available_repos(repositories.to_owned(), ctx);
+                    state.set_available_repos(repositories.to_owned(), &wd_model, ctx);
                 }
 
                 let new_selected = self
@@ -543,6 +640,34 @@ impl RightPanelView {
                     state.set_focused_repo(focused_repo.clone(), ctx);
                 }
 
+                // Auto-follow: when focus moves to a worktree the panel knows
+                // about, switch the dropdown selection to that worktree. This
+                // makes the panel track wherever the agent is presenting,
+                // since the agent typically operates inside the focused pane.
+                #[cfg(feature = "local_fs")]
+                if let Some(focused) = focused_repo.clone() {
+                    let wd_model = self.working_directories_model.clone();
+                    let already_known = self
+                        .code_review_state
+                        .as_ref()
+                        .map(|s| s.available_repos.iter().any(|r| r == &focused))
+                        .unwrap_or(false);
+                    if already_known {
+                        if let Some(state) = self.code_review_state.as_mut() {
+                            state.set_selected_repo_internal(focused, true, &wd_model, ctx);
+                        }
+                        // Make sure the underlying CodeReviewView exists for
+                        // the newly-selected worktree so its diffs render.
+                        if let Some(selected) = self
+                            .code_review_state
+                            .as_ref()
+                            .and_then(|s| s.selected_repo_path.clone())
+                        {
+                            self.ensure_code_review_view_exists(&selected, ctx);
+                        }
+                    }
+                }
+
                 self.recompute_terminal_availability(ctx);
                 ctx.notify();
             }
@@ -576,7 +701,7 @@ impl RightPanelView {
                     .map(|repos| repos.collect())
                     .unwrap_or_default()
             });
-            state.set_available_repos(active_repositories, ctx);
+            state.set_available_repos(active_repositories, working_directories_model, ctx);
         }
 
         let selected = self
@@ -611,12 +736,16 @@ impl RightPanelView {
             return;
         };
         let pane_group_id = active_pane_group.id();
+        let working_directories_model = self.working_directories_model.clone();
 
         if repo_dropdown_state.selected_repo_path.is_none() {
-            repo_dropdown_state.set_selected_repo(repo_path.clone(), ctx);
+            repo_dropdown_state.set_selected_repo(
+                repo_path.clone(),
+                &working_directories_model,
+                ctx,
+            );
         }
         // Check if we already have a cached CodeReviewView
-        let working_directories_model = self.working_directories_model.clone();
         let existing_view = working_directories_model
             .as_ref(ctx)
             .get_code_review_view(pane_group_id, repo_path);
@@ -1676,12 +1805,14 @@ impl TypedActionView for RightPanelView {
                 if is_switching {
                     self.close_active_code_review_view(ctx);
                 }
+                let wd_model = self.working_directories_model.clone();
                 if let Some(state) = &mut self.code_review_state {
                     // Don't update dropdown when selection comes from dropdown itself
                     let should_update_dropdown = !from_dropdown;
                     state.set_selected_repo_internal(
                         repo_path.clone(),
                         should_update_dropdown,
+                        &wd_model,
                         ctx,
                     );
                     self.ensure_code_review_view_exists(repo_path, ctx);

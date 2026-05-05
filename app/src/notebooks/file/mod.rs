@@ -9,6 +9,8 @@ use warp_util::path::user_friendly_path;
 #[cfg(feature = "local_fs")]
 use warpui::clipboard::ClipboardContent;
 use warpui::{
+    AppContext, Element, Entity, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
+    ViewHandle,
     accessibility::{AccessibilityContent, WarpA11yRole},
     elements::{
         Align, Container, CrossAxisAlignment, DispatchEventResult, Empty, EventHandler, Flex,
@@ -21,8 +23,6 @@ use warpui::{
         button::{ButtonVariant, TextAndIcon, TextAndIconAlignment},
         components::{UiComponent, UiComponentStyles},
     },
-    AppContext, Element, Entity, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
-    ViewHandle,
 };
 
 #[cfg(feature = "local_fs")]
@@ -34,13 +34,13 @@ use crate::{
     menu::{MenuItem, MenuItemFields},
     notebooks::editor::{model::NotebooksEditorModel, rich_text_styles},
     pane_group::{
+        BackingView, PaneConfiguration, PaneEvent,
         focus_state::PaneFocusHandle,
         pane::view,
         pane::view::header::components::{
-            render_pane_header_buttons, render_pane_header_title_text, render_three_column_header,
-            CenteredHeaderEdgeWidth,
+            CenteredHeaderEdgeWidth, render_pane_header_buttons, render_pane_header_title_text,
+            render_three_column_header,
         },
-        BackingView, PaneConfiguration, PaneEvent,
     },
     safe_warn, send_telemetry_from_ctx,
     server::telemetry::{NotebookActionEvent, NotebookTelemetryMetadata, TelemetryEvent},
@@ -53,19 +53,19 @@ use crate::{
 };
 
 use super::{
-    context_menu::{show_rich_editor_context_menu, ContextMenuAction, ContextMenuState},
+    NotebookLocation,
+    context_menu::{ContextMenuAction, ContextMenuState, show_rich_editor_context_menu},
     editor::view::{EditorViewEvent, RichTextEditorConfig, RichTextEditorView},
     link::{NotebookLinks, SessionSource},
     styles,
     telemetry::NotebookTelemetryAction,
-    NotebookLocation,
 };
 #[cfg(feature = "local_fs")]
 use crate::code::editor_management::CodeSource;
 #[cfg(feature = "local_fs")]
 use crate::util::openable_file_type::FileTarget;
 use warp_core::ui::icons::ICON_DIMENSIONS;
-use warp_editor::model::CoreEditorModel;
+use warp_editor::model::{CoreEditorModel, RichTextEditorModel};
 #[cfg(feature = "local_fs")]
 use warp_files::{FileModel, FileModelEvent};
 #[cfg(feature = "local_fs")]
@@ -105,6 +105,10 @@ pub struct FileNotebookView {
     /// This is preserved so we can restore it when toggling between raw and rendered Markdown.
     #[cfg(feature = "local_fs")]
     code_source: Option<CodeSource>,
+    /// Cached raw markdown source of the currently displayed file. Used to
+    /// resolve a selection (which carries plain text) back to source-line
+    /// numbers so we can send "file.md L5-L7" context to an agent.
+    cached_markdown_source: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +125,16 @@ pub enum FileNotebookEvent {
         path: PathBuf,
         target: FileTarget,
         line_col: Option<warp_util::path::LineAndColumnArg>,
+    },
+    /// Emitted when the user invokes "Send Selection to Agent" on the rendered
+    /// markdown view. Carries the file path, the inclusive 1-indexed source-line
+    /// range (best effort; `None` if the selection couldn't be located in the
+    /// raw markdown), and the literal selected plain text.
+    #[cfg(feature = "local_fs")]
+    SendSelectionToAgent {
+        file_path: PathBuf,
+        line_range: Option<std::ops::RangeInclusive<usize>>,
+        selected_text: String,
     },
 }
 
@@ -144,6 +158,10 @@ pub enum FileNotebookAction {
     OpenAsCode,
     ContextMenu(ContextMenuAction),
     ToggleMarkdownDisplayMode(MarkdownDisplayMode),
+    /// Send the currently-selected portion of the rendered markdown to the
+    /// active terminal/agent as context.
+    #[cfg(feature = "local_fs")]
+    SendSelectionToAgent,
 }
 
 impl From<ContextMenuAction> for FileNotebookAction {
@@ -294,6 +312,7 @@ impl FileNotebookView {
             display_mode_segmented_control,
             #[cfg(feature = "local_fs")]
             code_source: None,
+            cached_markdown_source: None,
         }
     }
 
@@ -325,6 +344,7 @@ impl FileNotebookView {
     /// Reset the rich text contents based on the given Markdown content.
     pub fn set_content(&mut self, content: &str, ctx: &mut ViewContext<Self>) {
         let doc_path = self.file_state.local_path().map(|p| p.to_path_buf());
+        self.cached_markdown_source = Some(content.to_string());
         self.editor.update(ctx, |editor, ctx| {
             editor.reset_with_markdown(content, ctx);
             // Set the document path for resolving relative image paths
@@ -548,6 +568,37 @@ impl FileNotebookView {
                 source: self.code_source.clone(),
             }));
         }
+    }
+
+    /// Reads the user's current selection from the rendered markdown, locates
+    /// it in the cached raw markdown source to recover a 1-indexed source-line
+    /// range, and emits a `SendSelectionToAgent` event the pane group routes
+    /// to the active terminal/agent.
+    ///
+    /// Best-effort: falls back to no line range when the selection text can't
+    /// be matched against the raw source (e.g. tables that are reformatted).
+    #[cfg(feature = "local_fs")]
+    fn send_selection_to_agent(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(file_path) = self.local_path() else {
+            return;
+        };
+        let model = self.editor.as_ref(ctx).model().clone();
+        let clipboard = model
+            .as_ref(ctx)
+            .read_selected_text_as_clipboard_content(ctx);
+        let selected_text = clipboard.plain_text;
+        if selected_text.trim().is_empty() {
+            return;
+        }
+        let line_range = self
+            .cached_markdown_source
+            .as_deref()
+            .and_then(|src| locate_text_line_range(src, &selected_text));
+        ctx.emit(FileNotebookEvent::SendSelectionToAgent {
+            file_path,
+            line_range,
+            selected_text,
+        });
     }
 
     /// The path to the currently-open file, if it is local.
@@ -892,6 +943,8 @@ impl TypedActionView for FileNotebookView {
                 }
                 self.context_menu.handle_action(action, ctx);
             }
+            #[cfg(feature = "local_fs")]
+            FileNotebookAction::SendSelectionToAgent => self.send_selection_to_agent(ctx),
             FileNotebookAction::ToggleMarkdownDisplayMode(mode) => {
                 self.markdown_display_mode = *mode;
                 self.display_mode_segmented_control
@@ -965,6 +1018,21 @@ impl BackingView for FileNotebookView {
                         .with_on_select_action(FileNotebookAction::CopyFilePath)
                         .into_item(),
                 ]);
+                // Only meaningful for local markdown files; always show the
+                // entry — disabled state is handled at action time when there
+                // is no selection.
+                if matches!(
+                    self.file_state.source(),
+                    Some(SourceFile::Local { local_path, .. })
+                        if is_markdown_file(local_path)
+                ) {
+                    actions.extend([
+                        MenuItem::Separator,
+                        MenuItemFields::new("Send selection to agent")
+                            .with_on_select_action(FileNotebookAction::SendSelectionToAgent)
+                            .into_item(),
+                    ]);
+                }
             }
         }
         actions
@@ -1089,6 +1157,74 @@ impl FileLocation {
     }
 }
 
+/// Locates `needle` inside `haystack` and returns the inclusive 1-indexed
+/// source-line range it occupies. Returns `None` if the needle cannot be
+/// found verbatim. The match is the first occurrence; longer selections that
+/// span multiple paragraphs may not match if the rendered text differs from
+/// the source (e.g. soft-wrapped lines, reformatted tables).
+#[cfg(feature = "local_fs")]
+fn locate_text_line_range(haystack: &str, needle: &str) -> Option<std::ops::RangeInclusive<usize>> {
+    let trimmed = needle.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Try the trimmed selection first, then the original. The trimmed form
+    // tolerates trailing newlines added by rendering; the original handles
+    // selections that include exact whitespace.
+    let byte_offset = haystack.find(trimmed).or_else(|| haystack.find(needle))?;
+    let consumed = haystack.get(..byte_offset)?;
+    let start_line = consumed.bytes().filter(|b| *b == b'\n').count() + 1;
+    let matched_len =
+        if haystack.is_char_boundary(byte_offset) && haystack[byte_offset..].starts_with(trimmed) {
+            trimmed.len()
+        } else {
+            needle.len()
+        };
+    let end_byte = byte_offset + matched_len;
+    let end_consumed = haystack.get(..end_byte)?;
+    let mut end_line = end_consumed.bytes().filter(|b| *b == b'\n').count() + 1;
+    // If the match ends exactly at a newline, it spans the previous line.
+    if end_consumed.ends_with('\n') {
+        end_line -= 1;
+    }
+    if end_line < start_line {
+        end_line = start_line;
+    }
+    Some(start_line..=end_line)
+}
+
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "local_fs"))]
+mod source_line_lookup_tests {
+    use super::locate_text_line_range;
+
+    #[test]
+    fn locates_single_line_paragraph() {
+        let src = "first paragraph\n\nsecond paragraph\n\nthird\n";
+        let range = locate_text_line_range(src, "second paragraph").expect("found");
+        assert_eq!(range, 3..=3);
+    }
+
+    #[test]
+    fn locates_multi_line_block() {
+        let src = "intro\n\n```rust\nfn x() {}\nlet y = 1;\n```\n\nafter\n";
+        let range = locate_text_line_range(src, "fn x() {}\nlet y = 1;").expect("found");
+        assert_eq!(range, 4..=5);
+    }
+
+    #[test]
+    fn returns_none_for_missing_text() {
+        let src = "hello\nworld\n";
+        assert!(locate_text_line_range(src, "not present").is_none());
+    }
+
+    #[test]
+    fn handles_trailing_newline_in_selection() {
+        let src = "alpha\nbeta\ngamma\n";
+        let range = locate_text_line_range(src, "beta\n").expect("found");
+        assert_eq!(range, 2..=2);
+    }
+}

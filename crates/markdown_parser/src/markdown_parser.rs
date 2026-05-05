@@ -104,20 +104,53 @@ impl ListIndentationContext {
 }
 
 pub fn parse_markdown(markdown: &str) -> Result<FormattedText> {
-    parse_markdown_impl(markdown, false)
+    parse_markdown_impl(markdown, false).map(|(text, _)| text)
 }
 
 pub fn parse_markdown_with_gfm_tables(markdown: &str) -> Result<FormattedText> {
-    parse_markdown_impl(markdown, true)
+    parse_markdown_impl(markdown, true).map(|(text, _)| text)
 }
 
-fn parse_markdown_impl(markdown: &str, parse_gfm_tables: bool) -> Result<FormattedText> {
+/// Same as [`parse_markdown`] but additionally returns, for each
+/// `FormattedTextLine` in the resulting AST, the half-open 0-indexed range
+/// of source lines (lines in the original input string) that produced it.
+///
+/// `result.0.lines.len() == result.1.len()`. Line breaks dropped at the end
+/// (see [`parse_markdown`]) are dropped from both the AST and the ranges.
+///
+/// Useful for mapping a buffer-level selection back onto the underlying
+/// markdown source (e.g. to send "file.md L5-L7" to an agent).
+pub fn parse_markdown_with_source_lines(
+    markdown: &str,
+) -> Result<(FormattedText, Vec<std::ops::Range<usize>>)> {
+    parse_markdown_impl(markdown, false)
+}
+
+fn parse_markdown_impl(
+    markdown: &str,
+    parse_gfm_tables: bool,
+) -> Result<(FormattedText, Vec<std::ops::Range<usize>>)> {
     parse_markdown_internal::<'_, nom::error::Error<_>>(markdown, parse_gfm_tables)
         .map(|(_, mut res)| {
-            if let Some(FormattedTextLine::LineBreak) = res.last() {
+            // Drop a trailing LineBreak from both the AST and its line ranges
+            // to mirror the historical behavior of `parse_markdown_impl`.
+            if let Some((last_line, _)) = res.last()
+                && matches!(last_line, FormattedTextLine::LineBreak)
+            {
                 res.pop();
             }
-            FormattedText { lines: res.into() }
+            let mut lines = Vec::with_capacity(res.len());
+            let mut ranges = Vec::with_capacity(res.len());
+            for (line, range) in res {
+                lines.push(line);
+                ranges.push(range);
+            }
+            (
+                FormattedText {
+                    lines: lines.into(),
+                },
+                ranges,
+            )
         })
         .map_err(|err| {
             if cfg!(debug_assertions) {
@@ -136,7 +169,7 @@ pub fn parse_markdown_to_raw_text(markdown: &str) -> Result<String> {
 fn parse_markdown_internal<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
     markdown: &'a str,
     parse_gfm_tables: bool,
-) -> IResult<&'a str, Vec<FormattedTextLine>, E> {
+) -> IResult<&'a str, Vec<(FormattedTextLine, std::ops::Range<usize>)>, E> {
     let indentation_context = RefCell::new(ListIndentationContext::new());
 
     let mut block = context(
@@ -185,10 +218,32 @@ fn parse_markdown_internal<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
         )),
     );
 
+    let total_len = markdown.len();
     let mut remaining = markdown;
-    let mut lines = Vec::new();
+    let mut lines: Vec<(FormattedTextLine, std::ops::Range<usize>)> = Vec::new();
+    // Number of `\n` characters before the start of `remaining` in the
+    // original input. This is the 0-indexed source-line index of the next
+    // block we'll parse.
+    let mut current_line: usize = 0;
     while !remaining.is_empty() {
+        let consumed_before = total_len - remaining.len();
         let (remaining_after_block, mut line) = block(remaining)?;
+        let consumed_after = total_len - remaining_after_block.len();
+        // Count newlines in the slice we just consumed to compute the
+        // half-open source-line range of this block.
+        let consumed_slice = &markdown[consumed_before..consumed_after];
+        let consumed_lines = consumed_slice.bytes().filter(|b| *b == b'\n').count();
+        // Each block consumes at least the line it appears on, even if the
+        // slice contains no newline (e.g. EOF without trailing newline).
+        let block_line_count = if consumed_slice.is_empty() {
+            0
+        } else if consumed_lines == 0 {
+            1
+        } else {
+            consumed_lines
+        };
+        let line_range = current_line..(current_line + block_line_count);
+        current_line += consumed_lines;
         remaining = remaining_after_block;
 
         // Clear indentation context for non-list content and handle ordered list numbering
@@ -203,7 +258,7 @@ fn parse_markdown_internal<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
                 // For ordered lists, only the starting item's number is applied. We reset the number for
                 // subsequent items here because, in isolation, we don't know if a given list item starts a
                 // list or not.
-                if let Some(FormattedTextLine::OrderedList(prev_list_item)) = lines.last()
+                if let Some((FormattedTextLine::OrderedList(prev_list_item), _)) = lines.last()
                     && prev_list_item.indented_text.indent_level
                         >= list_item.indented_text.indent_level
                 {
@@ -215,7 +270,7 @@ fn parse_markdown_internal<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
                 indentation_context.borrow_mut().clear();
             }
         }
-        lines.push(line);
+        lines.push((line, line_range));
     }
 
     Ok((remaining, lines))
