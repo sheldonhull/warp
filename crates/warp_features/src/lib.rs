@@ -853,6 +853,12 @@ pub enum FeatureFlag {
     ConfigurableContextWindow,
     /// Enables continuing cloud mode conversations in the cloud after an execution ends.
     HandoffCloudCloud,
+
+    /// WarpBazinga sidebar redesign: promotes the conversation status icon to be the
+    /// sole row icon, tints rows by status, and introduces NEEDS ME / RUNNING / IDLE
+    /// section headers in the conversation list. The same status tint is applied to
+    /// vertical_tabs rows. Off by default.
+    WarpBazingaSidebar,
 }
 
 static FLAG_STATES: [AtomicBool; cardinality::<FeatureFlag>()] =

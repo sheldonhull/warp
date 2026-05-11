@@ -1044,6 +1044,23 @@ fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
             FeatureFlag::UseTantivySearch.set_enabled(true);
         }
 
+        // WarpBazinga: default-on for local builds. The user can flip it off via
+        // `WARP_BAZINGA=0` if they need to compare against the legacy sidebar.
+        // A proper user-preference toggle in Settings → Features is a follow-up.
+        let bazinga_off = matches!(
+            std::env::var("WARP_BAZINGA").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        );
+        if !bazinga_off {
+            FeatureFlag::WarpBazingaSidebar.set_enabled(true);
+            log::info!(
+                "WarpBazinga sidebar enabled (flag={})",
+                FeatureFlag::WarpBazingaSidebar.is_enabled()
+            );
+        } else {
+            log::info!("WarpBazinga sidebar disabled via WARP_BAZINGA env");
+        }
+
         launch(ctx, app_state, launch_mode);
     })
 }

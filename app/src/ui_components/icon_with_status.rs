@@ -9,6 +9,8 @@ use warpui::elements::{
 };
 
 use crate::ai::agent::conversation::ConversationStatus;
+use crate::ai::conversation_status_ui::StatusElementStyle;
+use crate::features::FeatureFlag;
 use crate::terminal::CLIAgent;
 use crate::themes::theme::Fill as ThemeFill;
 
@@ -134,6 +136,83 @@ pub(crate) fn render_icon_with_status(
     status_container_background: WarpThemeFill,
 ) -> Box<dyn Element> {
     let sub_text = theme.sub_text_color(theme.background());
+
+    // WarpBazinga: when the flag is on, drop the brand-circle + corner-badge composite
+    // for agent variants. With a status present, the status icon (in its status color)
+    // becomes the sole glyph at `total_size`. Without a status, the agent's own brand
+    // glyph is rendered alone at `total_size` — no circle background, no badge.
+    if FeatureFlag::WarpBazingaSidebar.is_enabled() {
+        let bazinga_element: Option<Box<dyn Element>> = match &variant {
+            IconWithStatusVariant::OzAgent { status, is_ambient } => {
+                if let Some(status) = status.as_ref() {
+                    let (icon, color) = status.status_icon_and_color(theme);
+                    Some(
+                        ConstrainedBox::new(
+                            icon.to_warpui_icon(WarpThemeFill::Solid(color)).finish(),
+                        )
+                        .with_width(total_size)
+                        .with_height(total_size)
+                        .finish(),
+                    )
+                } else {
+                    let glyph = if *is_ambient {
+                        WarpIcon::OzCloud
+                    } else {
+                        WarpIcon::Oz
+                    };
+                    Some(
+                        ConstrainedBox::new(
+                            glyph
+                                .to_warpui_icon(theme.main_text_color(theme.background()))
+                                .finish(),
+                        )
+                        .with_width(total_size)
+                        .with_height(total_size)
+                        .finish(),
+                    )
+                }
+            }
+            IconWithStatusVariant::CLIAgent { agent, status, .. } => {
+                if let Some(status) = status.as_ref() {
+                    let (icon, color) = status.status_icon_and_color(theme);
+                    Some(
+                        ConstrainedBox::new(
+                            icon.to_warpui_icon(WarpThemeFill::Solid(color)).finish(),
+                        )
+                        .with_width(total_size)
+                        .with_height(total_size)
+                        .finish(),
+                    )
+                } else {
+                    // WarpBazinga: color the agent glyph with the brand *background* color
+                    // (e.g. Claude orange) — not `brand_icon_color()`, which is white and
+                    // designed to sit on top of that background. Without the circle, white
+                    // would disappear on the dark sidebar.
+                    let glyph_color = WarpThemeFill::Solid(
+                        agent.brand_color().unwrap_or(ColorU::new(200, 200, 200, 255)),
+                    );
+                    let icon_element = agent
+                        .icon()
+                        .map(|icon| icon.to_warpui_icon(glyph_color).finish())
+                        .unwrap_or_else(|| {
+                            WarpIcon::Terminal
+                                .to_warpui_icon(sub_text)
+                                .finish()
+                        });
+                    Some(
+                        ConstrainedBox::new(icon_element)
+                            .with_width(total_size)
+                            .with_height(total_size)
+                            .finish(),
+                    )
+                }
+            }
+            _ => None,
+        };
+        if let Some(el) = bazinga_element {
+            return el;
+        }
+    }
 
     match variant {
         IconWithStatusVariant::Neutral { icon, icon_color } => render_neutral_circle(

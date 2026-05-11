@@ -2,6 +2,7 @@ pub mod telemetry;
 
 use crate::ai::agent::conversation::ConversationStatus;
 use crate::ai::agent_management::AgentNotificationsModel;
+use crate::ai::conversation_status_ui::status_tint_color;
 use crate::code::editor::{add_color, remove_color};
 use crate::code::icon_from_file_path;
 use crate::safe_triangle::SafeTriangle;
@@ -1646,27 +1647,175 @@ fn render_groups(
         groups = groups.with_spacing(TABS_MODE_ITEM_SPACING);
     }
 
-    for (visible_tab_index, (tab_index, filtered_pane_ids)) in visible_tabs.iter().enumerate() {
-        // Insert ghost slot before this tab group if the drop would land here.
-        if ghost_insertion_index == Some(*tab_index) {
-            groups.add_child(render_ghost_vertical_tab_slot(workspace, app));
+    let bazinga_on = FeatureFlag::WarpBazingaSidebar.is_enabled();
+
+    if bazinga_on {
+        // WarpBazinga: bucket tabs into NEEDS ME / RUNNING / IDLE sections, then sub-
+        // group each section by cwd basename. Section headers are bold with a
+        // colored bar prefix; group headers are uppercase + dim.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum BazingaSec {
+            NeedsMe,
+            Running,
+            Idle,
         }
-        let insert_before_index = *tab_index;
-        let insert_after_index =
-            (visible_tab_index == visible_tabs.len() - 1).then_some(tab_index + 1);
-        groups.add_child(render_tab_group(
-            state,
-            workspace,
-            *tab_index,
-            &workspace.tabs[*tab_index],
-            filtered_pane_ids.as_deref(),
-            TabGroupDragState {
-                is_any_pane_dragging,
-                insert_before_index,
-                insert_after_index,
-            },
-            app,
-        ));
+        let classify = |tab_idx: usize| -> BazingaSec {
+            let tab = &workspace.tabs[tab_idx];
+            let pane_group = tab.pane_group.as_ref(app);
+            let mut best: Option<ConversationStatus> = None;
+            for pid in pane_group.visible_pane_ids() {
+                if let Some(tv) = pane_group.terminal_view_from_pane_id(pid, app) {
+                    if let Some(s) = bazinga_terminal_view_status(tv.as_ref(app), app) {
+                        if best
+                            .as_ref()
+                            .map(|b| conversation_status_priority(b))
+                            .unwrap_or(0)
+                            < conversation_status_priority(&s)
+                        {
+                            best = Some(s);
+                        }
+                    }
+                }
+            }
+            if let Some(s) = best {
+                return match s {
+                    ConversationStatus::Blocked { .. } | ConversationStatus::Error => {
+                        BazingaSec::NeedsMe
+                    }
+                    ConversationStatus::InProgress => BazingaSec::Running,
+                    _ => BazingaSec::Idle,
+                };
+            }
+            // Long-running is only a Running signal for plain terminal panes (no
+            // agent attached). Agent tabs that are awaiting input should read as
+            // IDLE even though their process is still alive.
+            let has_agent = pane_group.visible_pane_ids().iter().any(|pid| {
+                pane_group
+                    .terminal_view_from_pane_id(*pid, app)
+                    .and_then(|tv| {
+                        crate::ui_components::agent_icon::terminal_view_agent_icon_variant(
+                            tv.as_ref(app),
+                            app,
+                        )
+                    })
+                    .is_some()
+            });
+            if has_agent {
+                return BazingaSec::Idle;
+            }
+            let any_running = pane_group.visible_pane_ids().iter().any(|pid| {
+                pane_group
+                    .terminal_view_from_pane_id(*pid, app)
+                    .map(|tv| tv.as_ref(app).is_long_running_and_user_controlled())
+                    .unwrap_or(false)
+            });
+            if any_running {
+                BazingaSec::Running
+            } else {
+                BazingaSec::Idle
+            }
+        };
+
+        // Build a sortable list. Preserve original tab ordering inside each (section, group)
+        // bucket so the user's manual ordering isn't completely shuffled.
+        let mut rows: Vec<(BazingaSec, String, usize, Option<Vec<PaneId>>, usize)> =
+            visible_tabs
+                .iter()
+                .enumerate()
+                .map(|(vidx, (tab_idx, fpids))| {
+                    (
+                        classify(*tab_idx),
+                        bazinga_tab_group_name(&workspace.tabs[*tab_idx], app),
+                        *tab_idx,
+                        fpids.clone(),
+                        vidx,
+                    )
+                })
+                .collect();
+        rows.sort_by_key(|(sec, group, _, _, vidx)| {
+            (
+                match sec {
+                    BazingaSec::NeedsMe => 0u8,
+                    BazingaSec::Running => 1,
+                    BazingaSec::Idle => 2,
+                },
+                group.clone(),
+                *vidx,
+            )
+        });
+
+        let mut last_sec: Option<BazingaSec> = None;
+        let mut last_group: Option<String> = None;
+        for i in 0..rows.len() {
+            let (sec, group, tab_idx, fpids, _vidx) = rows[i].clone();
+            if last_sec != Some(sec) {
+                let count = rows[i..].iter().take_while(|r| r.0 == sec).count();
+                let sec_tag: u8 = match sec {
+                    BazingaSec::NeedsMe => 0,
+                    BazingaSec::Running => 1,
+                    BazingaSec::Idle => 2,
+                };
+                groups.add_child(render_bazinga_section_header(
+                    sec_label(sec_tag),
+                    count,
+                    sec_color(sec_tag, theme),
+                    app,
+                ));
+                last_sec = Some(sec);
+                last_group = None;
+            }
+            if last_group.as_ref() != Some(&group) {
+                let count = rows[i..]
+                    .iter()
+                    .take_while(|r| r.0 == sec && r.1 == group)
+                    .count();
+                groups.add_child(render_bazinga_group_header(&group, count, app));
+                last_group = Some(group.clone());
+            }
+            if ghost_insertion_index == Some(tab_idx) {
+                groups.add_child(render_ghost_vertical_tab_slot(workspace, app));
+            }
+            let is_last_visual = i + 1 == rows.len();
+            let insert_before_index = tab_idx;
+            let insert_after_index = is_last_visual.then_some(tab_idx + 1);
+            groups.add_child(render_tab_group(
+                state,
+                workspace,
+                tab_idx,
+                &workspace.tabs[tab_idx],
+                fpids.as_deref(),
+                TabGroupDragState {
+                    is_any_pane_dragging,
+                    insert_before_index,
+                    insert_after_index,
+                },
+                app,
+            ));
+        }
+    } else {
+        for (visible_tab_index, (tab_index, filtered_pane_ids)) in
+            visible_tabs.iter().enumerate()
+        {
+            if ghost_insertion_index == Some(*tab_index) {
+                groups.add_child(render_ghost_vertical_tab_slot(workspace, app));
+            }
+            let insert_before_index = *tab_index;
+            let insert_after_index =
+                (visible_tab_index == visible_tabs.len() - 1).then_some(tab_index + 1);
+            groups.add_child(render_tab_group(
+                state,
+                workspace,
+                *tab_index,
+                &workspace.tabs[*tab_index],
+                filtered_pane_ids.as_deref(),
+                TabGroupDragState {
+                    is_any_pane_dragging,
+                    insert_before_index,
+                    insert_after_index,
+                },
+                app,
+            ));
+        }
     }
     // Ghost after all tab groups (fencepost).
     if ghost_insertion_index == Some(workspace.tabs.len()) {
@@ -1699,6 +1848,160 @@ fn render_groups(
         Container::new(groups)
             .with_padding(Padding::uniform(8.).with_top(0.))
             .finish()
+    }
+}
+
+/// WarpBazinga section label + accent color helpers — kept tiny so they're easy
+/// to tweak alongside the playground spec.
+fn sec_label(sec: u8) -> &'static str {
+    match sec {
+        0 => "NEEDS ME",
+        1 => "RUNNING",
+        _ => "IDLE",
+    }
+}
+fn sec_color(sec: u8, theme: &WarpTheme) -> ColorU {
+    match sec {
+        0 => theme.ansi_fg_yellow(),
+        1 => theme.ansi_fg_cyan(),
+        _ => ColorU::new(140, 140, 150, 255),
+    }
+}
+
+/// WarpBazinga: render a bold section band header (NEEDS ME / RUNNING / IDLE)
+/// with a colored bar prefix and an item count.
+fn render_bazinga_section_header(
+    label: &'static str,
+    count: usize,
+    color: ColorU,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+    let bar = ConstrainedBox::new(
+        Container::new(Flex::row().finish())
+            .with_background(ThemeFill::Solid(color))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(2.)))
+            .finish(),
+    )
+    .with_width(4.)
+    .with_height(18.)
+    .finish();
+    let title = Text::new_inline(
+        label.to_string(),
+        appearance.ui_font_family(),
+        12.,
+    )
+    .with_color(WarpThemeFill::Solid(color).into())
+    .with_style(Properties::default().weight(Weight::Bold))
+    .finish();
+    let count_text = Text::new_inline(
+        format!("{}", count),
+        appearance.ui_font_family(),
+        10.5,
+    )
+    .with_color(theme.sub_text_color(theme.background()).into())
+    .finish();
+    let row = Flex::row()
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_spacing(8.)
+        .with_child(bar)
+        .with_child(title)
+        .with_child(count_text)
+        .finish();
+    Container::new(row)
+        .with_padding(
+            Padding::uniform(0.)
+                .with_top(14.)
+                .with_left(10.)
+                .with_bottom(6.),
+        )
+        .finish()
+}
+
+/// WarpBazinga: derive a human-readable group name for a tab from the first pane
+/// that has a local cwd. Uses the cwd's basename. Falls back to "Other" when no
+/// pane in the tab exposes a local cwd.
+fn bazinga_tab_group_name(tab: &TabData, app: &AppContext) -> String {
+    let pane_group = tab.pane_group.as_ref(app);
+    for pid in pane_group.visible_pane_ids() {
+        if let Some(tv) = pane_group.terminal_view_from_pane_id(pid, app) {
+            if let Some(cwd) = tv.as_ref(app).pwd_if_local(app) {
+                let path = std::path::Path::new(&cwd);
+                if let Some(name) = path.file_name() {
+                    return name.to_string_lossy().to_string();
+                }
+            }
+        }
+    }
+    "Other".to_string()
+}
+
+/// WarpBazinga: render the small uppercase group label that introduces a cluster of
+/// tabs sharing a cwd. Visual contract: 10px, sub-text color, padded.
+fn render_bazinga_group_header(name: &str, count: usize, app: &AppContext) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+    let label = Text::new_inline(
+        format!("{}  {}", name.to_uppercase(), count),
+        appearance.ui_font_family(),
+        10.,
+    )
+    .with_color(theme.sub_text_color(theme.background()).into())
+    .finish();
+    Container::new(label)
+        .with_padding(
+            Padding::uniform(0.)
+                .with_top(10.)
+                .with_left(14.)
+                .with_bottom(4.),
+        )
+        .finish()
+}
+
+/// WarpBazinga: returns the most urgent ConversationStatus across CLI session
+/// state and the AIConversation model, for a single terminal view. Session
+/// status is only trusted when the agent's session handler exposes rich status
+/// (e.g. plugin-backed agents). Claude and other non-rich-status agents are
+/// permanently `InProgress` at the session level even while waiting on user
+/// input — we ignore that and let them fall through to None/IDLE.
+fn bazinga_terminal_view_status(
+    tv: &crate::terminal::view::TerminalView,
+    app: &AppContext,
+) -> Option<ConversationStatus> {
+    let conv = tv.selected_conversation_status_for_display(app);
+    let session = CLIAgentSessionsModel::as_ref(app).session(tv.id());
+    let session_status = session
+        .filter(|s| {
+            s.listener.is_some()
+                && crate::terminal::cli_agent_sessions::listener::agent_supports_rich_status(
+                    &s.agent,
+                )
+        })
+        .map(|s| s.status.to_conversation_status());
+    match (conv, session_status) {
+        (Some(a), Some(b)) => {
+            if conversation_status_priority(&a) >= conversation_status_priority(&b) {
+                Some(a)
+            } else {
+                Some(b)
+            }
+        }
+        (Some(s), None) | (None, Some(s)) => Some(s),
+        (None, None) => None,
+    }
+}
+
+/// WarpBazinga: priority ordering for ConversationStatus. Higher number = more
+/// attention. Used by tab row tint derivation to pick the most urgent status
+/// across a tab's panes.
+fn conversation_status_priority(status: &ConversationStatus) -> u8 {
+    match status {
+        ConversationStatus::Blocked { .. } => 4,
+        ConversationStatus::Error => 3,
+        ConversationStatus::InProgress => 2,
+        ConversationStatus::Cancelled => 1,
+        ConversationStatus::Success => 0,
     }
 }
 
@@ -1739,6 +2042,49 @@ fn render_tab_group_internal(
     let pane_group = tab.pane_group.as_ref(app);
     let pane_group_id = tab.pane_group.id();
     let visible_pane_ids = pane_group.visible_pane_ids();
+
+    // WarpBazinga: tint the tab row by its section. Agent tabs defer entirely to
+    // their conversation status — a Claude session "waiting on user" reads as IDLE
+    // even though the agent process is long-running. Long-running is only treated
+    // as a Running signal for plain terminal tabs (no agent attached).
+    let bazinga_tint: Option<ColorU> = if FeatureFlag::WarpBazingaSidebar.is_enabled() {
+        let conv = visible_pane_ids
+            .iter()
+            .filter_map(|pid| {
+                pane_group
+                    .terminal_view_from_pane_id(*pid, app)
+                    .and_then(|tv| bazinga_terminal_view_status(tv.as_ref(app), app))
+            })
+            .max_by_key(conversation_status_priority);
+        let has_agent = visible_pane_ids.iter().any(|pid| {
+            pane_group
+                .terminal_view_from_pane_id(*pid, app)
+                .and_then(|tv| {
+                    crate::ui_components::agent_icon::terminal_view_agent_icon_variant(
+                        tv.as_ref(app),
+                        app,
+                    )
+                })
+                .is_some()
+        });
+        let any_running = visible_pane_ids.iter().any(|pid| {
+            pane_group
+                .terminal_view_from_pane_id(*pid, app)
+                .map(|tv| tv.as_ref(app).is_long_running_and_user_controlled())
+                .unwrap_or(false)
+        });
+        let (base, alpha): (ColorU, u8) = match &conv {
+            Some(ConversationStatus::Blocked { .. }) | Some(ConversationStatus::Error) => {
+                (theme.ansi_fg_yellow(), 22)
+            }
+            Some(ConversationStatus::InProgress) => (theme.ansi_fg_cyan(), 18),
+            _ if !has_agent && any_running => (theme.ansi_fg_cyan(), 18),
+            _ => (ColorU::new(140, 140, 150, 255), 6),
+        };
+        Some(coloru_with_opacity(base, alpha))
+    } else {
+        None
+    };
     let resolved_mode = resolve_vertical_tabs_mode(app);
     let display_granularity = match resolved_mode {
         VerticalTabsResolvedMode::Panes => VerticalTabsDisplayGranularity::Panes,
@@ -1965,6 +2311,8 @@ fn render_tab_group_internal(
                 internal_colors::fg_overlay_2(theme)
             } else if is_active || group_state.is_hovered() {
                 internal_colors::fg_overlay_1(theme)
+            } else if let Some(tint) = bazinga_tint {
+                ThemeFill::Solid(tint)
             } else {
                 ThemeFill::Solid(ColorU::transparent_black())
             };
@@ -1986,6 +2334,8 @@ fn render_tab_group_internal(
                 internal_colors::fg_overlay_2(theme)
             } else if is_active || group_state.is_hovered() {
                 internal_colors::fg_overlay_1(theme)
+            } else if let Some(tint) = bazinga_tint {
+                ThemeFill::Solid(tint)
             } else {
                 ThemeFill::Solid(ColorU::transparent_black())
             };
@@ -2318,6 +2668,21 @@ fn resolve_icon_with_status_variant(
             let terminal_view = terminal_view.as_ref(app);
             if let Some(variant) = terminal_view_agent_icon_variant(terminal_view, app) {
                 variant
+            } else if FeatureFlag::WarpBazingaSidebar.is_enabled() {
+                // WarpBazinga: recolor the plain-terminal icon by activity. Long-running
+                // commands tint the glyph with the running state color so the row reads
+                // as "doing work" even with no agent attached.
+                if terminal_view.is_long_running_and_user_controlled() {
+                    IconWithStatusVariant::Neutral {
+                        icon: WarpIcon::Terminal,
+                        icon_color: WarpThemeFill::Solid(theme.ansi_fg_cyan()),
+                    }
+                } else {
+                    IconWithStatusVariant::Neutral {
+                        icon: WarpIcon::Terminal,
+                        icon_color: sub_text,
+                    }
+                }
             } else {
                 // Plain terminal: use foreground color per design spec
                 IconWithStatusVariant::Neutral {
@@ -3677,6 +4042,16 @@ fn render_summary_pane_kind_icon_circle(
     if let Some(variant) = ambient_agent_variant(&kind) {
         return render_icon_with_status(variant, total_size, 0., theme, theme.background());
     }
+
+    // WarpBazinga: for agent kinds in summary mode, drop the brand-color circle and
+    // render the agent glyph alone at full size. Keeps the row consistent with the
+    // sole-icon contract used in `render_icon_with_status`.
+    if FeatureFlag::WarpBazingaSidebar.is_enabled() {
+        if let Some(icon_element) = bazinga_summary_agent_icon(&kind, total_size, theme) {
+            return icon_element;
+        }
+    }
+
     let icon_size = total_size * SUMMARY_INLINE_ICON_RATIO;
     let padding = total_size * SUMMARY_INLINE_PADDING_RATIO;
     let (icon_element, background): (Box<dyn Element>, ElementFill) = match kind {
@@ -3746,6 +4121,40 @@ fn render_summary_pane_kind_icon_circle(
         (icon_size + padding * 2.) / 2.,
     )))
     .finish()
+}
+
+/// WarpBazinga: produces the sole-icon glyph for an agent summary-pane kind, without the
+/// brand-color circle background. Returns None for non-agent kinds so the caller falls
+/// through to its normal inline rendering.
+fn bazinga_summary_agent_icon(
+    kind: &SummaryPaneKind,
+    total_size: f32,
+    theme: &WarpTheme,
+) -> Option<Box<dyn Element>> {
+    let icon_size = total_size * SUMMARY_INLINE_ICON_RATIO;
+    let padding = total_size * SUMMARY_INLINE_PADDING_RATIO;
+    let (icon, color) = match kind {
+        SummaryPaneKind::OzAgent { .. } => (WarpIcon::Oz, oz_icon_fill(theme)),
+        SummaryPaneKind::CLIAgent { agent, .. } => (
+            agent.icon().unwrap_or(WarpIcon::Terminal),
+            // Use the brand background color for the glyph; brand_icon_color() is
+            // white and was designed for the orange circle behind it.
+            WarpThemeFill::Solid(
+                agent.brand_color().unwrap_or(ColorU::new(200, 200, 200, 255)),
+            ),
+        ),
+        _ => return None,
+    };
+    Some(
+        Container::new(
+            ConstrainedBox::new(icon.to_warpui_icon(color).finish())
+                .with_width(icon_size)
+                .with_height(icon_size)
+                .finish(),
+        )
+        .with_uniform_padding(padding)
+        .finish(),
+    )
 }
 
 /// Maps an ambient Oz / CLI agent summary-pane kind to the `IconWithStatusVariant` used to

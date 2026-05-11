@@ -66,6 +66,10 @@ struct StateHandles {
     zero_state_button: MouseStateHandle,
     active_header: MouseStateHandle,
     past_header: MouseStateHandle,
+    // WarpBazinga: section headers for the state-derived bucketing.
+    needs_me_header: MouseStateHandle,
+    running_header: MouseStateHandle,
+    idle_header: MouseStateHandle,
 }
 
 impl Default for StateHandles {
@@ -79,6 +83,9 @@ impl Default for StateHandles {
             zero_state_button: MouseStateHandle::default(),
             active_header: MouseStateHandle::default(),
             past_header: MouseStateHandle::default(),
+            needs_me_header: MouseStateHandle::default(),
+            running_header: MouseStateHandle::default(),
+            idle_header: MouseStateHandle::default(),
         }
     }
 }
@@ -87,6 +94,12 @@ impl Default for StateHandles {
 pub enum ConversationSection {
     Active,
     Past,
+    // WarpBazinga: state-derived buckets used when the flag is enabled. They
+    // sit alongside Active/Past so the existing rendering infra (collapse,
+    // header click, mouse state lookup) reuses the same enum.
+    NeedsMe,
+    Running,
+    Idle,
 }
 
 /// Represents an item in the uniform list - either a section header or a conversation.
@@ -339,6 +352,86 @@ impl ConversationListView {
 
         let mut items = Vec::new();
         let has_content = !active_items.is_empty() || !past_items.is_empty();
+
+        // WarpBazinga: re-bucket by ConversationStatus into NEEDS ME / RUNNING / IDLE
+        // sections, replacing the Active/Past split. The state-derived split gives
+        // immediate triage signal at the top of the list.
+        if FeatureFlag::WarpBazingaSidebar.is_enabled() {
+            use crate::ai::agent::conversation::ConversationStatus;
+            // Collect entry IDs in order, then look up statuses with the model + ctx
+            // and bucket. Avoids double-borrow of ctx through a closure.
+            let mut needs_me_items: Vec<ListItem> = Vec::new();
+            let mut running_items: Vec<ListItem> = Vec::new();
+            let mut idle_items: Vec<ListItem> = Vec::new();
+            let ordered: Vec<ListItem> = active_items
+                .into_iter()
+                .chain(past_items.into_iter())
+                .collect();
+            for item in ordered.into_iter() {
+                let entry = match &item {
+                    ListItem::Conversation(e) => e.clone(),
+                    _ => {
+                        idle_items.push(item);
+                        continue;
+                    }
+                };
+                let bucket = match model.get_item_by_id(&entry.id, ctx) {
+                    Some(conv) => match conv.status(ctx) {
+                        ConversationStatus::Blocked { .. } | ConversationStatus::Error => {
+                            ConversationSection::NeedsMe
+                        }
+                        ConversationStatus::InProgress => ConversationSection::Running,
+                        _ => ConversationSection::Idle,
+                    },
+                    None => ConversationSection::Idle,
+                };
+                match bucket {
+                    ConversationSection::NeedsMe => needs_me_items.push(item),
+                    ConversationSection::Running => running_items.push(item),
+                    _ => idle_items.push(item),
+                }
+            }
+
+            let push_section = |out: &mut Vec<ListItem>,
+                                section: ConversationSection,
+                                bucket: Vec<ListItem>,
+                                collapsed: bool| {
+                if bucket.is_empty() {
+                    return;
+                }
+                out.push(ListItem::SectionHeader(section));
+                if !collapsed {
+                    out.extend(bucket);
+                }
+            };
+            push_section(
+                &mut items,
+                ConversationSection::NeedsMe,
+                needs_me_items,
+                self.collapsed_sections
+                    .contains(&ConversationSection::NeedsMe),
+            );
+            push_section(
+                &mut items,
+                ConversationSection::Running,
+                running_items,
+                self.collapsed_sections
+                    .contains(&ConversationSection::Running),
+            );
+            if has_content {
+                items.push(ListItem::StartNewConversation);
+            }
+            push_section(
+                &mut items,
+                ConversationSection::Idle,
+                idle_items,
+                self.collapsed_sections.contains(&ConversationSection::Idle),
+            );
+
+            self.total_past_items = 0;
+            self.list_items = Arc::new(items);
+            return;
+        }
 
         // If the section is not empty, add the section header + items.
         if !active_items.is_empty() {
@@ -786,6 +879,9 @@ fn render_section_header(
         match section {
             ConversationSection::Active => "ACTIVE",
             ConversationSection::Past => "PAST",
+            ConversationSection::NeedsMe => "NEEDS ME",
+            ConversationSection::Running => "RUNNING",
+            ConversationSection::Idle => "IDLE",
         },
         appearance.ui_font_family(),
         11.,
@@ -1200,6 +1296,9 @@ impl View for ConversationListView {
             let collapsed_sections = self.collapsed_sections.clone();
             let active_header_mouse_state = self.state_handles.active_header.clone();
             let past_header_mouse_state = self.state_handles.past_header.clone();
+            let needs_me_header_mouse_state = self.state_handles.needs_me_header.clone();
+            let running_header_mouse_state = self.state_handles.running_header.clone();
+            let idle_header_mouse_state = self.state_handles.idle_header.clone();
             let toggle_view_all_button = self.toggle_view_all_button.clone();
             let list_items = self.list_items.clone();
             let overflow_menu = self.item_overflow_menu.clone();
@@ -1237,6 +1336,15 @@ impl View for ConversationListView {
                                         }
                                         ConversationSection::Past => {
                                             past_header_mouse_state.clone()
+                                        }
+                                        ConversationSection::NeedsMe => {
+                                            needs_me_header_mouse_state.clone()
+                                        }
+                                        ConversationSection::Running => {
+                                            running_header_mouse_state.clone()
+                                        }
+                                        ConversationSection::Idle => {
+                                            idle_header_mouse_state.clone()
                                         }
                                     };
                                     Some(render_section_header(

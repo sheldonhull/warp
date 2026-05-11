@@ -1,7 +1,10 @@
 use crate::ai::active_agent_views_model::ActiveAgentViewsModel;
 use crate::ai::active_agent_views_model::ConversationOrTaskId;
 use crate::ai::agent_conversations_model::ConversationOrTask;
-use crate::ai::conversation_status_ui::{render_status_element, STATUS_ELEMENT_PADDING};
+use crate::ai::conversation_status_ui::{
+    render_state_only_icon, render_status_element, status_tint_color, STATUS_ELEMENT_PADDING,
+};
+use crate::features::FeatureFlag;
 use crate::appearance::Appearance;
 use crate::drive::sharing::dialog::SharingDialog;
 use crate::menu::Menu;
@@ -210,7 +213,13 @@ pub fn render_item(props: ItemProps<'_>, app: &AppContext) -> Box<dyn Element> {
     // ambient runs) so the row matches the vertical tab / pane header. Fall back to the
     // plain status-only icon when the helper can't produce an agent variant (never today,
     // but keeps the surface future-proof).
-    let icon_element: Box<dyn Element> =
+    //
+    // WarpBazinga: when the experimental sidebar flag is on, both branches are bypassed
+    // and the row uses the state icon as its sole glyph — no brand circle, no badge,
+    // no rounded background box.
+    let icon_element: Box<dyn Element> = if FeatureFlag::WarpBazingaSidebar.is_enabled() {
+        render_state_only_icon(&conversation.status(app), LIST_ITEM_AGENT_SIZE, appearance)
+    } else {
         match conversation_or_task_agent_icon_variant(conversation, app) {
             Some(variant) => render_icon_with_status(
                 variant,
@@ -220,7 +229,8 @@ pub fn render_item(props: ItemProps<'_>, app: &AppContext) -> Box<dyn Element> {
                 theme.background(),
             ),
             None => render_status_element(&conversation.status(app), font_size, appearance),
-        };
+        }
+    };
 
     let icon_and_title_row = Shrinkable::new(
         1.0,
@@ -285,6 +295,17 @@ pub fn render_item(props: ItemProps<'_>, app: &AppContext) -> Box<dyn Element> {
     let title = conversation.title(app);
     let tooltip_text = truncate_from_end(&title, MAX_TOOLTIP_LENGTH);
     let overflow_button_state = state.overflow_button_state.clone();
+
+    // WarpBazinga: compute the row tint from conversation status. None when the flag
+    // is off or the status maps to no tint; in either case the row falls through to
+    // its default (theme) background.
+    let bazinga_tint: Option<warpui::color::ColorU> =
+        if FeatureFlag::WarpBazingaSidebar.is_enabled() {
+            status_tint_color(&conversation.status(app), theme)
+        } else {
+            None
+        };
+
     let hoverable = Hoverable::new(state.mouse_state.clone(), move |_| {
         let container = Container::new(row)
             .with_horizontal_padding(12.)
@@ -294,6 +315,8 @@ pub fn render_item(props: ItemProps<'_>, app: &AppContext) -> Box<dyn Element> {
             container.with_background(theme.surface_overlay_2())
         } else if is_selected || !matches!(overflow_menu_display, OverflowMenuDisplay::Closed) {
             container.with_background(theme.surface_overlay_1())
+        } else if let Some(tint) = bazinga_tint {
+            container.with_background(tint)
         } else {
             container
         };
