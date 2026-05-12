@@ -5,6 +5,7 @@
 use anyhow::Result;
 use warp_core::{
     channel::{Channel, ChannelConfig, ChannelState, OzConfig, WarpServerConfig},
+    features::FeatureFlag,
     AppId,
 };
 
@@ -22,7 +23,16 @@ fn main() -> Result<()> {
             autoupdate_config: None,
             mcp_static_config: None,
         },
-    );
+    )
+    // Required to receive structured OSC 777 notifications from third-party
+    // CLI agent plugins (e.g. claude-code-warp). PluggableNotifications gates
+    // OSC -> terminal Event conversion; HOANotifications gates the
+    // WARP_CLI_AGENT_PROTOCOL_VERSION env var that signals protocol support
+    // to plugins and renders the agent notification UI.
+    .with_additional_features(&[
+        FeatureFlag::PluggableNotifications,
+        FeatureFlag::HOANotifications,
+    ]);
     if cfg!(debug_assertions) {
         state = state.with_additional_features(warp_core::features::DEBUG_FLAGS);
     }
