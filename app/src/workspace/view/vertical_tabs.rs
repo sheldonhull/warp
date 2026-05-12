@@ -7,7 +7,6 @@ use crate::code::editor::{add_color, remove_color};
 use crate::code::icon_from_file_path;
 use crate::safe_triangle::SafeTriangle;
 use crate::send_telemetry_from_app_ctx;
-use crate::terminal::cli_agent_sessions::listener::agent_supports_rich_status;
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::view::TerminalViewState;
 use crate::terminal::CLIAgent;
@@ -29,7 +28,8 @@ use crate::editor::EditorView;
 use crate::pane_group::pane::IPaneType;
 use crate::pane_group::TerminalPane;
 use crate::pane_group::{
-    CodePane, NotebookPane, PaneGroup, PaneId, TabBarHoverIndex, WorkflowPane,
+    CodePane, NotebookPane, PaneGroup, PaneId, PaneNode, SplitDirection, TabBarHoverIndex,
+    WorkflowPane,
 };
 use crate::tab::{tab_position_id, SelectedTabColor, TabData};
 use crate::terminal::session_settings::SessionSettings;
@@ -109,6 +109,11 @@ const TAB_COLOR_HOVER_OPACITY: Opacity = 50;
 
 // Circular icon constants
 const ICON_WITH_STATUS_GAP: f32 = 8.;
+
+// WarpBazinga: shared agent-activity window constant lives in
+// `conversation_status_ui::BAZINGA_AGENT_ACTIVE_WINDOW_MS` so the sidebar bucket
+// tier and the row icon tier read from the same source.
+use crate::ai::conversation_status_ui::BAZINGA_AGENT_ACTIVE_WINDOW_MS;
 pub(super) const VERTICAL_TABS_DETAIL_SIDECAR_POSITION_ID: &str = "vertical_tabs:detail_sidecar";
 
 /// Total size of the icon-with-status component rendered for each vertical-tabs row.
@@ -270,6 +275,7 @@ fn pane_row_background(
     is_selected: bool,
     is_hovered: bool,
     is_being_dragged: bool,
+    bazinga_tint: Option<ColorU>,
     theme: &WarpTheme,
 ) -> Option<ThemeFill> {
     if let Some(color) = pane_color {
@@ -278,13 +284,23 @@ fn pane_row_background(
         } else {
             TAB_COLOR_OPACITY
         };
-        Some(color.with_opacity(opacity))
-    } else if is_selected {
+        return Some(color.with_opacity(opacity));
+    }
+    // WarpBazinga: layer the per-pane status tint underneath selection/hover/drag
+    // so the row's state signal survives mouse interactions. Without the tint,
+    // selection/hover use their plain overlay colors (matching legacy behavior).
+    let overlay = if is_selected {
         Some(internal_colors::fg_overlay_2(theme))
     } else if is_being_dragged || is_hovered {
         Some(internal_colors::fg_overlay_1(theme))
     } else {
         None
+    };
+    match (bazinga_tint, overlay) {
+        (Some(tint), Some(over)) => Some(ThemeFill::Solid(bazinga_blend_over(tint, over))),
+        (Some(tint), None) => Some(ThemeFill::Solid(tint)),
+        (None, Some(over)) => Some(over),
+        (None, None) => None,
     }
 }
 
@@ -326,6 +342,8 @@ fn render_pane_row_element(
         rename_editor: _,
         is_pane_being_renamed,
         pane_rename_editor: _,
+        bazinga_tint,
+        bazinga_mirror_icon: _,
     } = props;
     let is_selected = is_active_tab && is_focused;
     let mut row = Hoverable::new(mouse_state, move |state| {
@@ -338,6 +356,7 @@ fn render_pane_row_element(
             is_selected,
             state.is_hovered(),
             is_being_dragged,
+            bazinga_tint,
             theme,
         ) {
             container = container.with_background(background);
@@ -688,6 +707,17 @@ struct PaneProps<'a> {
     rename_editor: Option<ViewHandle<EditorView>>,
     is_pane_being_renamed: bool,
     pane_rename_editor: Option<ViewHandle<EditorView>>,
+    /// WarpBazinga: per-pane status tint resolved by the caller from the pane's
+    /// [`bazinga_terminal_view_status`]. Applied as the row background by
+    /// `pane_row_background` and blended under selection/hover overlays so the
+    /// state signal survives mouse interactions in multi-pane groups.
+    bazinga_tint: Option<ColorU>,
+    /// WarpBazinga: precomputed grid-mirror icon for multi-pane tab rows. When
+    /// `Some`, the row's left icon slot renders this mini layout preview
+    /// (rectangles arranged like the underlying split panes, each tinted by its
+    /// pane's status) instead of the legacy single state icon. `None` for
+    /// single-pane rows.
+    bazinga_mirror_icon: Option<Box<dyn Element>>,
 }
 
 struct PaneRowState {
@@ -807,7 +837,18 @@ struct TabGroupDragState {
 
 fn resolve_vertical_tabs_mode(app: &AppContext) -> VerticalTabsResolvedMode {
     let settings = TabSettings::as_ref(app);
-    match *settings.vertical_tabs_display_granularity.value() {
+    // WarpBazinga: default to Tabs granularity (FocusedSession or Summary) when
+    // the bazinga sidebar is on, regardless of the user's persisted setting.
+    // The grid-mirror icon (multi-pane preview in a single row) is the bazinga
+    // design — surfacing it requires collapsing each tab to one row. Users who
+    // explicitly switched to Panes mode override this via the toggle UI; that
+    // change still persists, but the default reads as Tabs.
+    let granularity = if FeatureFlag::WarpBazingaSidebar.is_enabled() {
+        VerticalTabsDisplayGranularity::Tabs
+    } else {
+        *settings.vertical_tabs_display_granularity.value()
+    };
+    match granularity {
         VerticalTabsDisplayGranularity::Panes => VerticalTabsResolvedMode::Panes,
         VerticalTabsDisplayGranularity::Tabs => match *settings.vertical_tabs_tab_item_mode.value()
         {
@@ -1744,53 +1785,60 @@ fn render_groups(
             )
         });
 
-        let mut last_sec: Option<BazingaSec> = None;
-        let mut last_group: Option<String> = None;
-        for i in 0..rows.len() {
-            let (sec, group, tab_idx, fpids, _vidx) = rows[i].clone();
-            if last_sec != Some(sec) {
-                let count = rows[i..].iter().take_while(|r| r.0 == sec).count();
-                let sec_tag: u8 = match sec {
-                    BazingaSec::NeedsMe => 0,
-                    BazingaSec::Running => 1,
-                    BazingaSec::Idle => 2,
-                };
-                groups.add_child(render_bazinga_section_header(
-                    sec_label(sec_tag),
-                    count,
-                    sec_color(sec_tag, theme),
-                    app,
-                ));
-                last_sec = Some(sec);
-                last_group = None;
-            }
-            if last_group.as_ref() != Some(&group) {
-                let count = rows[i..]
-                    .iter()
-                    .take_while(|r| r.0 == sec && r.1 == group)
-                    .count();
-                groups.add_child(render_bazinga_group_header(&group, count, app));
-                last_group = Some(group.clone());
-            }
-            if ghost_insertion_index == Some(tab_idx) {
-                groups.add_child(render_ghost_vertical_tab_slot(workspace, app));
-            }
-            let is_last_visual = i + 1 == rows.len();
-            let insert_before_index = tab_idx;
-            let insert_after_index = is_last_visual.then_some(tab_idx + 1);
-            groups.add_child(render_tab_group(
-                state,
-                workspace,
-                tab_idx,
-                &workspace.tabs[tab_idx],
-                fpids.as_deref(),
-                TabGroupDragState {
-                    is_any_pane_dragging,
-                    insert_before_index,
-                    insert_after_index,
-                },
+        // WarpBazinga: render all three section bars unconditionally so the
+        // sidebar reads as a fixed status frame — empty buckets still show
+        // their bar at a dim version of the palette color so the structure
+        // "lights up" as rows move between buckets.
+        for sec_tag in 0u8..=2 {
+            let sec_enum = match sec_tag {
+                0 => BazingaSec::NeedsMe,
+                1 => BazingaSec::Running,
+                _ => BazingaSec::Idle,
+            };
+            let section_rows: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.0 == sec_enum)
+                .collect();
+            let count = section_rows.len();
+            groups.add_child(render_bazinga_section_header(
+                sec_label(sec_tag),
+                count,
+                sec_color(sec_tag, theme),
+                count > 0,
                 app,
             ));
+            let mut last_group: Option<String> = None;
+            for (i_in_rows, _) in &section_rows {
+                let (_, group, tab_idx, fpids, _vidx) = rows[*i_in_rows].clone();
+                if last_group.as_ref() != Some(&group) {
+                    let group_count = rows[*i_in_rows..]
+                        .iter()
+                        .take_while(|r| r.0 == sec_enum && r.1 == group)
+                        .count();
+                    groups.add_child(render_bazinga_group_header(&group, group_count, app));
+                    last_group = Some(group.clone());
+                }
+                if ghost_insertion_index == Some(tab_idx) {
+                    groups.add_child(render_ghost_vertical_tab_slot(workspace, app));
+                }
+                let is_last_visual = *i_in_rows + 1 == rows.len();
+                let insert_before_index = tab_idx;
+                let insert_after_index = is_last_visual.then_some(tab_idx + 1);
+                groups.add_child(render_tab_group(
+                    state,
+                    workspace,
+                    tab_idx,
+                    &workspace.tabs[tab_idx],
+                    fpids.as_deref(),
+                    TabGroupDragState {
+                        is_any_pane_dragging,
+                        insert_before_index,
+                        insert_after_index,
+                    },
+                    app,
+                ));
+            }
         }
     } else {
         for (visible_tab_index, (tab_index, filtered_pane_ids)) in
@@ -1860,24 +1908,38 @@ fn sec_label(sec: u8) -> &'static str {
         _ => "IDLE",
     }
 }
-fn sec_color(sec: u8, theme: &WarpTheme) -> ColorU {
+fn sec_color(sec: u8, _theme: &WarpTheme) -> ColorU {
+    // WarpBazinga: section accent colors are drawn from the same `BAZINGA_*_COLOR`
+    // palette the row icons + row tints use, so the bar + label match the rows
+    // beneath them. Edit the palette in `conversation_status_ui.rs`.
     match sec {
-        0 => theme.ansi_fg_yellow(),
-        1 => theme.ansi_fg_cyan(),
-        _ => ColorU::new(140, 140, 150, 255),
+        0 => crate::ai::conversation_status_ui::BAZINGA_BLOCKED_COLOR,
+        1 => crate::ai::conversation_status_ui::BAZINGA_IN_PROGRESS_COLOR,
+        _ => crate::ai::conversation_status_ui::bazinga_idle_color(),
     }
 }
 
 /// WarpBazinga: render a bold section band header (NEEDS ME / RUNNING / IDLE)
-/// with a colored bar prefix and an item count.
+/// with a colored bar prefix and an item count. When `is_active` is false the
+/// section currently has no rows, so the bar and label render at ~35% alpha so
+/// the structure stays visible while clearly reading as dormant.
 fn render_bazinga_section_header(
     label: &'static str,
     count: usize,
     color: ColorU,
+    is_active: bool,
     app: &AppContext,
 ) -> Box<dyn Element> {
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
+    let color = if is_active {
+        color
+    } else {
+        coloru_with_opacity(color, 35)
+    };
+    // WarpBazinga: H1-style section header — chunky bar + 16px bold label + count
+    // pill, all in the section's palette color. Reads as a hard divider between
+    // NEEDS ME / RUNNING / IDLE so the eye snaps to the top before scanning rows.
     let bar = ConstrainedBox::new(
         Container::new(Flex::row().finish())
             .with_background(ThemeFill::Solid(color))
@@ -1885,12 +1947,12 @@ fn render_bazinga_section_header(
             .finish(),
     )
     .with_width(4.)
-    .with_height(18.)
+    .with_height(22.)
     .finish();
     let title = Text::new_inline(
         label.to_string(),
         appearance.ui_font_family(),
-        12.,
+        16.,
     )
     .with_color(WarpThemeFill::Solid(color).into())
     .with_style(Properties::default().weight(Weight::Bold))
@@ -1898,10 +1960,12 @@ fn render_bazinga_section_header(
     let count_text = Text::new_inline(
         format!("{}", count),
         appearance.ui_font_family(),
-        10.5,
+        12.,
     )
-    .with_color(theme.sub_text_color(theme.background()).into())
+    .with_color(WarpThemeFill::Solid(color).into())
+    .with_style(Properties::default().weight(Weight::Bold))
     .finish();
+    let _ = theme;
     let row = Flex::row()
         .with_cross_axis_alignment(CrossAxisAlignment::Center)
         .with_spacing(8.)
@@ -1960,25 +2024,41 @@ fn render_bazinga_group_header(name: &str, count: usize, app: &AppContext) -> Bo
 }
 
 /// WarpBazinga: returns the most urgent ConversationStatus across CLI session
-/// state and the AIConversation model, for a single terminal view. Session
-/// status is only trusted when the agent's session handler exposes rich status
-/// (e.g. plugin-backed agents). Claude and other non-rich-status agents are
-/// permanently `InProgress` at the session level even while waiting on user
-/// input — we ignore that and let them fall through to None/IDLE.
+/// state and the AIConversation model, for a single terminal view.
+///
+/// Status sources, in priority order:
+/// 1. Connected plugin: when `plugin_version.is_some()`, trust `session.status`.
+///    This is the rich, event-driven path (PromptSubmit → InProgress, Stop →
+///    Success, PermissionRequest → Blocked, etc.).
+/// 2. No plugin but the active block is still running: treat as InProgress.
+///    Catches self-managed CLI agents (Claude without the statusline plugin
+///    installed) while they're actually churning — the terminal block is
+///    "active and long-running" for the lifetime of a Claude turn.
+/// 3. Otherwise fall through to the AIConversation status (`conv`).
 fn bazinga_terminal_view_status(
     tv: &crate::terminal::view::TerminalView,
     app: &AppContext,
 ) -> Option<ConversationStatus> {
     let conv = tv.selected_conversation_status_for_display(app);
     let session = CLIAgentSessionsModel::as_ref(app).session(tv.id());
-    let session_status = session
-        .filter(|s| {
-            s.listener.is_some()
-                && crate::terminal::cli_agent_sessions::listener::agent_supports_rich_status(
-                    &s.agent,
-                )
-        })
-        .map(|s| s.status.to_conversation_status());
+    let session_status = session.and_then(|s| {
+        if s.listener.is_some() && s.plugin_version.is_some() {
+            // Plugin-reported rich status — authoritative (Blocked, InProgress,
+            // Success, etc. flow through real OSC events from the statusline
+            // plugin).
+            return Some(s.status.to_conversation_status());
+        }
+        // Self-managed agent (no connected plugin): only the "streaming" signal
+        // is reliable — recent burst-confirmed PTY wakeups mean output is being
+        // produced. Past output cannot be classified as Blocked-vs-Idle without
+        // event-level signals (`QuestionAsked` / `PermissionRequest`), so we
+        // fall through to None (Idle) once streaming stops. Install the Warp
+        // Claude Code statusline plugin in this session to get real Blocked.
+        match tv.ms_since_last_wakeup() {
+            Some(ms) if ms < BAZINGA_AGENT_ACTIVE_WINDOW_MS => Some(ConversationStatus::InProgress),
+            _ => None,
+        }
+    });
     match (conv, session_status) {
         (Some(a), Some(b)) => {
             if conversation_status_priority(&a) >= conversation_status_priority(&b) {
@@ -2073,15 +2153,19 @@ fn render_tab_group_internal(
                 .map(|tv| tv.as_ref(app).is_long_running_and_user_controlled())
                 .unwrap_or(false)
         });
-        let (base, alpha): (ColorU, u8) = match &conv {
-            Some(ConversationStatus::Blocked { .. }) | Some(ConversationStatus::Error) => {
-                (theme.ansi_fg_yellow(), 22)
-            }
-            Some(ConversationStatus::InProgress) => (theme.ansi_fg_cyan(), 18),
-            _ if !has_agent && any_running => (theme.ansi_fg_cyan(), 18),
-            _ => (ColorU::new(140, 140, 150, 255), 6),
+        // Idle (no conv urgency, no plain-terminal long-running signal) leaves
+        // the row on the default surface so only attention-worthy and active
+        // rows pick up a tint. When a tint is applied, derive it from the same
+        // status color the row's icon uses (via status_tint_color) so tint and
+        // icon read as a single state signal.
+        let derived: Option<ConversationStatus> = match &conv {
+            Some(s @ ConversationStatus::Blocked { .. })
+            | Some(s @ ConversationStatus::Error)
+            | Some(s @ ConversationStatus::InProgress) => Some(s.clone()),
+            _ if !has_agent && any_running => Some(ConversationStatus::InProgress),
+            _ => None,
         };
-        Some(coloru_with_opacity(base, alpha))
+        derived.and_then(|s| status_tint_color(&s, theme))
     } else {
         None
     };
@@ -2307,10 +2391,20 @@ fn render_tab_group_internal(
                     .with_padding(body_padding)
                     .finish(),
             );
+            // WarpBazinga: layer the status tint underneath hover/active overlays
+            // so the row keeps its state color while the user mouses over it.
+            // Without this, the hover overlay (fg_overlay_1) replaces the tint
+            // and the row "loses" its state signal on cursor move.
             let background = if is_drag_target {
                 internal_colors::fg_overlay_2(theme)
             } else if is_active || group_state.is_hovered() {
-                internal_colors::fg_overlay_1(theme)
+                match bazinga_tint {
+                    Some(tint) => ThemeFill::Solid(bazinga_blend_over(
+                        tint,
+                        internal_colors::fg_overlay_1(theme),
+                    )),
+                    None => internal_colors::fg_overlay_1(theme),
+                }
             } else if let Some(tint) = bazinga_tint {
                 ThemeFill::Solid(tint)
             } else {
@@ -2333,7 +2427,13 @@ fn render_tab_group_internal(
             let background = if is_drag_target {
                 internal_colors::fg_overlay_2(theme)
             } else if is_active || group_state.is_hovered() {
-                internal_colors::fg_overlay_1(theme)
+                match bazinga_tint {
+                    Some(tint) => ThemeFill::Solid(bazinga_blend_over(
+                        tint,
+                        internal_colors::fg_overlay_1(theme),
+                    )),
+                    None => internal_colors::fg_overlay_1(theme),
+                }
             } else if let Some(tint) = bazinga_tint {
                 ThemeFill::Solid(tint)
             } else {
@@ -2763,16 +2863,19 @@ fn render_title_indicator(theme: &WarpTheme) -> Box<dyn Element> {
     .finish()
 }
 
-fn render_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn Element> {
+fn render_pane_row(mut props: PaneProps<'_>, app: &AppContext) -> Box<dyn Element> {
     let effective_subtitle = props.subtitle.clone();
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
     let font_family = appearance.ui_font_family();
 
-    let icon = render_pane_icon_with_status(
-        resolve_icon_with_status_variant(&props.typed, &props.title, appearance, app),
-        theme,
-    );
+    let icon = match props.bazinga_mirror_icon.take() {
+        Some(mirror) => mirror,
+        None => render_pane_icon_with_status(
+            resolve_icon_with_status_variant(&props.typed, &props.title, appearance, app),
+            theme,
+        ),
+    };
 
     // Top-align the icon when there are multiple lines of content so it sits next to
     // the first line; center it for single-line rows (Settings, Notebook with no subtitle, etc.).
@@ -3169,6 +3272,18 @@ impl<'a> PaneProps<'a> {
             pane_configuration.title_secondary().trim(),
         );
 
+        let bazinga_tint = bazinga_pane_tint(&typed, app);
+        // WarpBazinga: build the grid mirror once, in the constructor, when the row
+        // represents a tab (any granularity where multiple panes collapse into a
+        // single row) and the underlying group actually has ≥2 visible panes.
+        let bazinga_mirror_icon = if matches!(
+            display_granularity,
+            VerticalTabsDisplayGranularity::Tabs
+        ) {
+            bazinga_multi_pane_icon(pane_group, &pane_group.visible_pane_ids(), app)
+        } else {
+            None
+        };
         Some(Self {
             pane_id,
             pane_group_id,
@@ -3198,6 +3313,8 @@ impl<'a> PaneProps<'a> {
             rename_editor,
             is_pane_being_renamed,
             pane_rename_editor,
+            bazinga_tint,
+            bazinga_mirror_icon,
         })
     }
 
@@ -3560,6 +3677,56 @@ impl PaneGroup {
     }
 }
 
+/// WarpBazinga: inline brand glyph rendered before the row title for agent rows.
+/// The bazinga sidebar uses the state icon as the row's primary glyph; the brand
+/// (Oz mark, Claude/Codex/etc. icon) rides inline with the title text so brand
+/// identity is still readable without competing with state in the main icon slot.
+/// Returns `None` for non-agent rows or when the flag is off.
+fn bazinga_inline_brand_for_terminal(
+    terminal_view: &TerminalView,
+    theme: &WarpTheme,
+    app: &AppContext,
+) -> Option<Box<dyn Element>> {
+    if !FeatureFlag::WarpBazingaSidebar.is_enabled() {
+        return None;
+    }
+    let variant = terminal_view_agent_icon_variant(terminal_view, app)?;
+    bazinga_inline_brand_glyph(&variant, theme)
+}
+
+/// Renders the inline brand glyph for an agent variant at a fixed inline size.
+/// Shared so vertical_tabs and conversation_list/item render identical brand prefixes.
+pub(crate) fn bazinga_inline_brand_glyph(
+    variant: &IconWithStatusVariant,
+    theme: &WarpTheme,
+) -> Option<Box<dyn Element>> {
+    const BAZINGA_INLINE_BRAND_SIZE: f32 = 12.;
+    let glyph: Box<dyn Element> = match variant {
+        IconWithStatusVariant::OzAgent { is_ambient, .. } => {
+            let icon = if *is_ambient {
+                WarpIcon::OzCloud
+            } else {
+                WarpIcon::Oz
+            };
+            icon.to_warpui_icon(theme.main_text_color(theme.background()))
+                .finish()
+        }
+        IconWithStatusVariant::CLIAgent { agent, .. } => {
+            let color = WarpThemeFill::Solid(
+                agent.brand_color().unwrap_or(ColorU::new(220, 220, 220, 255)),
+            );
+            agent.icon()?.to_warpui_icon(color).finish()
+        }
+        _ => return None,
+    };
+    Some(
+        ConstrainedBox::new(glyph)
+            .with_width(BAZINGA_INLINE_BRAND_SIZE)
+            .with_height(BAZINGA_INLINE_BRAND_SIZE)
+            .finish(),
+    )
+}
+
 fn render_terminal_row_content(
     props: &PaneProps<'_>,
     terminal_view: &TerminalView,
@@ -3668,18 +3835,30 @@ fn render_terminal_row_content(
         }
     };
 
-    let first_line_element = if has_unread_activity(&props.typed, app) {
-        Flex::row()
+    let bazinga_brand = bazinga_inline_brand_for_terminal(terminal_view, theme, app);
+    let has_unread = has_unread_activity(&props.typed, app);
+    let first_line_element = if bazinga_brand.is_some() || has_unread {
+        let mut row = Flex::row()
             .with_main_axis_size(MainAxisSize::Max)
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-            .with_child(Shrinkable::new(1., first_line).finish())
-            .with_child(
+            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween);
+        let mut title_block = Flex::row()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(6.);
+        if let Some(brand) = bazinga_brand {
+            title_block.add_child(brand);
+        }
+        title_block.add_child(Shrinkable::new(1., first_line).finish());
+        row.add_child(Shrinkable::new(1., title_block.finish()).finish());
+        if has_unread {
+            row.add_child(
                 Container::new(render_title_indicator(theme))
                     .with_margin_left(4.)
                     .finish(),
-            )
-            .finish()
+            );
+        }
+        row.finish()
     } else {
         first_line
     };
@@ -3870,7 +4049,7 @@ fn render_pane_title_slot(
 }
 
 fn render_summary_tab_item(
-    props: PaneProps<'_>,
+    mut props: PaneProps<'_>,
     summary: &VerticalTabsSummaryData,
     summary_pane_kind_icons: Option<SummaryPaneKindIcons>,
     app: &AppContext,
@@ -3882,8 +4061,13 @@ fn render_summary_tab_item(
     let theme = appearance.theme();
     let main_text_color = theme.main_text_color(theme.background());
     let sub_text_color = theme.sub_text_color(theme.background());
-    let icon = summary_pane_kind_icons
-        .map(|icons| render_summary_pane_kind_icons(icons, appearance))
+    // WarpBazinga: when the row represents a multi-pane group, the bazinga grid
+    // mirror on `props` takes precedence over the legacy single-icon and
+    // kind-icons paths.
+    let icon = props
+        .bazinga_mirror_icon
+        .take()
+        .or_else(|| summary_pane_kind_icons.map(|icons| render_summary_pane_kind_icons(icons, appearance)))
         .unwrap_or_else(|| {
             render_pane_icon_with_status(
                 resolve_icon_with_status_variant(&props.typed, &props.title, appearance, app),
@@ -5644,6 +5828,130 @@ struct DetailSidecarTextColors {
     disabled: WarpThemeFill,
 }
 
+/// WarpBazinga: blend a status tint underneath the given hover/active overlay so
+/// the row keeps its state color while the user mouses over it. Without this the
+/// overlay fully replaces the tint and the row "loses" its state signal on hover.
+fn bazinga_blend_over(tint: ColorU, overlay: WarpThemeFill) -> ColorU {
+    WarpThemeFill::Solid(tint).blend(&overlay).into_solid()
+}
+
+/// WarpBazinga: per-leaf tint for the grid mirror. Returns the row's status
+/// color (icon-matched) if the leaf is a terminal pane with a tinted status,
+/// otherwise the bazinga idle gray so every cell still reads as "a pane".
+fn bazinga_leaf_color(pane_id: PaneId, pane_group: &PaneGroup, app: &AppContext) -> ColorU {
+    let theme = Appearance::as_ref(app).theme();
+    let Some(terminal_view) = pane_group.terminal_view_from_pane_id(pane_id, app) else {
+        return crate::ai::conversation_status_ui::bazinga_idle_color();
+    };
+    let tv = terminal_view.as_ref(app);
+    match bazinga_terminal_view_status(tv, app) {
+        Some(status) => crate::ai::conversation_status_ui::bazinga_status_icon_and_color(
+            &status, theme,
+        )
+        .1,
+        None => crate::ai::conversation_status_ui::bazinga_idle_color(),
+    }
+}
+
+/// WarpBazinga: renders a mini mirror of the pane group's split layout. Each
+/// pane becomes a small rounded rectangle filled with its status color (or the
+/// idle gray for panes with no tinted status). Branches recursively lay out
+/// children in a `Flex::row` (horizontal split) or `Flex::column` (vertical
+/// split), with each child sized in proportion to its [`PaneFlex`] weight so
+/// the mirror visually matches the underlying layout.
+fn bazinga_pane_mirror(
+    node: &PaneNode,
+    pane_group: &PaneGroup,
+    app: &AppContext,
+    total_width: f32,
+    total_height: f32,
+) -> Box<dyn Element> {
+    const CELL_GAP: f32 = 1.5;
+    const CELL_CORNER_RADIUS: f32 = 2.;
+    match node {
+        PaneNode::Leaf(pane_id) => {
+            let color = bazinga_leaf_color(*pane_id, pane_group, app);
+            let filled = Container::new(
+                ConstrainedBox::new(Empty::new().finish())
+                    .with_width(total_width)
+                    .with_height(total_height)
+                    .finish(),
+            )
+            .with_background(ThemeFill::Solid(color))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(CELL_CORNER_RADIUS)))
+            .finish();
+            ConstrainedBox::new(filled)
+                .with_width(total_width)
+                .with_height(total_height)
+                .finish()
+        }
+        PaneNode::Branch(branch) => {
+            let total_flex: f32 = branch.nodes.iter().map(|(f, _)| f.0).sum::<f32>().max(0.0001);
+            let is_horizontal = matches!(branch.axis(), SplitDirection::Horizontal);
+            let usable = if is_horizontal {
+                (total_width - CELL_GAP * (branch.nodes.len().saturating_sub(1)) as f32).max(0.)
+            } else {
+                (total_height - CELL_GAP * (branch.nodes.len().saturating_sub(1)) as f32).max(0.)
+            };
+            let mut row = if is_horizontal {
+                Flex::row().with_spacing(CELL_GAP)
+            } else {
+                Flex::column().with_spacing(CELL_GAP)
+            };
+            for (flex, child) in &branch.nodes {
+                let share = (flex.0 / total_flex) * usable;
+                let (cw, ch) = if is_horizontal {
+                    (share, total_height)
+                } else {
+                    (total_width, share)
+                };
+                row = row.with_child(bazinga_pane_mirror(child, pane_group, app, cw, ch));
+            }
+            ConstrainedBox::new(row.finish())
+                .with_width(total_width)
+                .with_height(total_height)
+                .finish()
+        }
+    }
+}
+
+/// WarpBazinga: builds the icon element for a multi-pane tab row when bazinga is
+/// on. Returns `None` for single-pane tabs (caller falls through to the regular
+/// state-icon path).
+fn bazinga_multi_pane_icon(
+    pane_group: &PaneGroup,
+    visible_pane_ids: &[PaneId],
+    app: &AppContext,
+) -> Option<Box<dyn Element>> {
+    if !FeatureFlag::WarpBazingaSidebar.is_enabled() || visible_pane_ids.len() < 2 {
+        return None;
+    }
+    Some(bazinga_pane_mirror(
+        pane_group.pane_root(),
+        pane_group,
+        app,
+        VERTICAL_TABS_ICON_SIZE,
+        VERTICAL_TABS_ICON_SIZE,
+    ))
+}
+
+/// WarpBazinga: per-pane status tint for an individual pane row. Returns `None`
+/// when the bazinga flag is off, the pane is not a terminal, or the terminal's
+/// status maps to "no tint" (idle/success/cancelled). Terminal panes that
+/// resolve to a tinted status (InProgress / Blocked / Error) return the same
+/// color the row's icon uses, so tint and icon read as one state signal.
+fn bazinga_pane_tint(typed: &TypedPane<'_>, app: &AppContext) -> Option<ColorU> {
+    if !FeatureFlag::WarpBazingaSidebar.is_enabled() {
+        return None;
+    }
+    let TypedPane::Terminal(terminal_pane) = typed else {
+        return None;
+    };
+    let terminal_view = terminal_pane.terminal_view(app);
+    let status = bazinga_terminal_view_status(terminal_view.as_ref(app), app)?;
+    status_tint_color(&status, Appearance::as_ref(app).theme())
+}
+
 fn detail_sidecar_background(theme: &WarpTheme) -> ColorU {
     theme
         .background()
@@ -5823,9 +6131,17 @@ fn render_terminal_detail_section(
         preferred_agent_tab_titles(&agent_text, agent_tab_text_preference(app));
     let kind_label = terminal_kind_badge_label(agent_text.is_oz_agent, agent_text.cli_agent);
     let status = if let Some(session) =
-        cli_agent_session.filter(|s| s.listener.is_some() && agent_supports_rich_status(&s.agent))
+        cli_agent_session.filter(|s| s.listener.is_some() && s.plugin_version.is_some())
     {
         Some(session.status.to_conversation_status())
+    } else if cli_agent_session.is_some() {
+        // Self-managed CLI agent without a connected plugin: streaming only.
+        // See `bazinga_terminal_view_status` for the rationale (Blocked needs
+        // real plugin events).
+        match terminal_view.ms_since_last_wakeup() {
+            Some(ms) if ms < BAZINGA_AGENT_ACTIVE_WINDOW_MS => Some(ConversationStatus::InProgress),
+            _ => None,
+        }
     } else if agent_text.is_oz_agent {
         terminal_view.selected_conversation_status_for_display(app)
     } else {
@@ -6250,7 +6566,7 @@ pub(super) fn render_detail_sidecar(
     })
 }
 
-fn render_compact_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn Element> {
+fn render_compact_pane_row(mut props: PaneProps<'_>, app: &AppContext) -> Box<dyn Element> {
     let effective_subtitle = props.subtitle.clone();
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
@@ -6259,10 +6575,13 @@ fn render_compact_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn El
     let font_family = appearance.ui_font_family();
     let has_indicator = props.typed.badge(app).is_some() || has_unread_activity(&props.typed, app);
 
-    let icon = render_pane_icon_with_status(
-        resolve_icon_with_status_variant(&props.typed, &props.title, appearance, app),
-        theme,
-    );
+    let icon = match props.bazinga_mirror_icon.take() {
+        Some(mirror) => mirror,
+        None => render_pane_icon_with_status(
+            resolve_icon_with_status_variant(&props.typed, &props.title, appearance, app),
+            theme,
+        ),
+    };
 
     let primary_info = *TabSettings::as_ref(app).vertical_tabs_primary_info.value();
     let compact_subtitle = resolve_compact_subtitle(

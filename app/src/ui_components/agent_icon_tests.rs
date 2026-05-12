@@ -169,6 +169,7 @@ impl CanonicalRunState {
                 selected_third_party_cli_agent: None,
                 selected_conversation_status: None,
                 has_selected_conversation: false,
+                ms_since_last_wakeup: None,
             },
             LocalOzInProgress => TerminalIconInputs {
                 is_ambient: false,
@@ -176,6 +177,7 @@ impl CanonicalRunState {
                 selected_third_party_cli_agent: None,
                 selected_conversation_status: Some(ConversationStatus::InProgress),
                 has_selected_conversation: true,
+                ms_since_last_wakeup: None,
             },
             CloudOzInProgress => TerminalIconInputs {
                 is_ambient: true,
@@ -183,6 +185,7 @@ impl CanonicalRunState {
                 selected_third_party_cli_agent: None,
                 selected_conversation_status: Some(ConversationStatus::InProgress),
                 has_selected_conversation: false,
+                ms_since_last_wakeup: None,
             },
             CloudClaudePreDispatch => TerminalIconInputs {
                 is_ambient: true,
@@ -190,6 +193,7 @@ impl CanonicalRunState {
                 selected_third_party_cli_agent: Some(CLIAgent::Claude),
                 selected_conversation_status: None,
                 has_selected_conversation: false,
+                ms_since_last_wakeup: None,
             },
             CloudClaudeInProgress => TerminalIconInputs {
                 is_ambient: true,
@@ -197,6 +201,7 @@ impl CanonicalRunState {
                 selected_third_party_cli_agent: Some(CLIAgent::Claude),
                 selected_conversation_status: Some(ConversationStatus::InProgress),
                 has_selected_conversation: false,
+                ms_since_last_wakeup: None,
             },
             ViewingCloudCodexTranscript => TerminalIconInputs {
                 // VM has shut down: the caller resolves these fields from the conversation's
@@ -206,24 +211,28 @@ impl CanonicalRunState {
                 selected_third_party_cli_agent: Some(CLIAgent::Codex),
                 selected_conversation_status: Some(ConversationStatus::Success),
                 has_selected_conversation: true,
+                ms_since_last_wakeup: None,
             },
             LocalClaudePluginInProgress => TerminalIconInputs {
                 is_ambient: false,
                 cli_session: Some(CLISessionInputs {
                     agent: CLIAgent::Claude,
                     has_listener: true,
+                    plugin_connected: true,
                     status: ConversationStatus::InProgress,
                     supports_rich_status: true,
                 }),
                 selected_third_party_cli_agent: None,
                 selected_conversation_status: None,
                 has_selected_conversation: false,
+                ms_since_last_wakeup: None,
             },
             LocalClaudePluginBlocked => TerminalIconInputs {
                 is_ambient: false,
                 cli_session: Some(CLISessionInputs {
                     agent: CLIAgent::Claude,
                     has_listener: true,
+                    plugin_connected: true,
                     status: ConversationStatus::Blocked {
                         blocked_action: String::new(),
                     },
@@ -232,18 +241,21 @@ impl CanonicalRunState {
                 selected_third_party_cli_agent: None,
                 selected_conversation_status: None,
                 has_selected_conversation: false,
+                ms_since_last_wakeup: None,
             },
             LocalClaudeCommandDetected => TerminalIconInputs {
                 is_ambient: false,
                 cli_session: Some(CLISessionInputs {
                     agent: CLIAgent::Claude,
                     has_listener: false,
+                    plugin_connected: false,
                     status: ConversationStatus::InProgress,
                     supports_rich_status: false,
                 }),
                 selected_third_party_cli_agent: None,
                 selected_conversation_status: None,
                 has_selected_conversation: false,
+                ms_since_last_wakeup: None,
             },
         }
     }

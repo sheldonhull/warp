@@ -18,6 +18,8 @@ use crate::ai::blocklist::BlocklistAIHistoryModel;
 use crate::terminal::cli_agent_sessions::listener::agent_supports_rich_status;
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::view::TerminalView;
+
+use crate::ai::conversation_status_ui::BAZINGA_AGENT_ACTIVE_WINDOW_MS;
 use crate::terminal::CLIAgent;
 use crate::ui_components::icon_with_status::IconWithStatusVariant;
 
@@ -63,6 +65,7 @@ pub(crate) fn terminal_view_agent_icon_variant(
         cli_session: cli_agent_session.map(|session| CLISessionInputs {
             agent: session.agent,
             has_listener: session.listener.is_some(),
+            plugin_connected: session.plugin_version.is_some(),
             status: session.status.to_conversation_status(),
             supports_rich_status: agent_supports_rich_status(&session.agent),
         }),
@@ -73,6 +76,7 @@ pub(crate) fn terminal_view_agent_icon_variant(
         has_selected_conversation: terminal_view
             .selected_conversation_display_title(app)
             .is_some(),
+        ms_since_last_wakeup: terminal_view.ms_since_last_wakeup(),
     };
     agent_icon_variant_from_terminal_inputs(&inputs)
 }
@@ -107,6 +111,12 @@ struct TerminalIconInputs {
     selected_conversation_status: Option<ConversationStatus>,
     /// Whether the terminal view currently has a selected conversation (ambient or local).
     has_selected_conversation: bool,
+    /// WarpBazinga: milliseconds since the terminal's last PTY wakeup, or `None`
+    /// if no wakeup has happened yet (fresh terminal). Used to tier the
+    /// self-managed CLI agent state — recent activity reads as InProgress, a
+    /// quiet window after activity reads as Blocked (waiting on user), and
+    /// long-quiet falls back to Idle.
+    ms_since_last_wakeup: Option<u64>,
 }
 
 /// CLI-session-derived inputs for the terminal waterfall.
@@ -115,6 +125,9 @@ struct CLISessionInputs {
     /// Whether the session is backed by a plugin listener. Plugin-backed sessions report
     /// rich status; command-detected sessions only know that an agent is running.
     has_listener: bool,
+    /// Whether the plugin has actually reported a `SessionStart` event (i.e. the plugin
+    /// install is active, not just declared). Without this, `session.status` is stale.
+    plugin_connected: bool,
     status: ConversationStatus,
     /// Whether the agent's session handler exposes rich status (plugin-backed handlers report
     /// rich status; Codex's OSC 9 handler does not).
@@ -126,15 +139,34 @@ struct CLISessionInputs {
 fn agent_icon_variant_from_terminal_inputs(
     inputs: &TerminalIconInputs,
 ) -> Option<IconWithStatusVariant> {
-    // 1. CLI session with a known (non-Unknown) agent wins. Status is only meaningful when
-    //    the session is plugin-backed and the handler exposes rich status.
+    // 1. CLI session with a known (non-Unknown) agent wins. Status priority:
+    //    a. Plugin-backed handler with rich status — trust `session.status`.
+    //    b. Otherwise, fall back to the terminal's `is_long_running` signal so a
+    //       self-managed agent (e.g. Claude without the statusline plugin) still reads
+    //       as InProgress while a turn is actively churning, and `None` (Idle) when
+    //       the block isn't running.
     if let Some(session) = inputs
         .cli_session
         .as_ref()
         .filter(|s| !matches!(s.agent, CLIAgent::Unknown))
     {
-        let status =
-            (session.has_listener && session.supports_rich_status).then(|| session.status.clone());
+        let status = if session.has_listener
+            && session.plugin_connected
+            && session.supports_rich_status
+        {
+            // Plugin-reported rich status — authoritative.
+            Some(session.status.clone())
+        } else {
+            // No connected plugin: only the "streaming" signal is reliable.
+            // Past output cannot be classified as Blocked-vs-Idle without real
+            // OSC events (`QuestionAsked` / `PermissionRequest`).
+            match inputs.ms_since_last_wakeup {
+                Some(ms) if ms < BAZINGA_AGENT_ACTIVE_WINDOW_MS => {
+                    Some(ConversationStatus::InProgress)
+                }
+                _ => None,
+            }
+        };
         return Some(IconWithStatusVariant::CLIAgent {
             agent: session.agent,
             status,

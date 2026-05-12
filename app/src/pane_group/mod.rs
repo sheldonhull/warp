@@ -4124,6 +4124,13 @@ impl PaneGroup {
         self.panes.visible_pane_ids()
     }
 
+    /// Root of this group's pane layout tree. Read-only access for callers that
+    /// need to mirror the split layout (e.g. the bazinga sidebar's pane-mirror
+    /// preview, which renders a mini split layout in the row).
+    pub fn pane_root(&self) -> &PaneNode {
+        &self.panes.root
+    }
+
     pub fn original_pane_for_replacement(&self, replacement_pane_id: PaneId) -> Option<PaneId> {
         self.panes
             .original_pane_for_replacement(replacement_pane_id)

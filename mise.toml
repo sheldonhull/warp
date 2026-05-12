@@ -1,0 +1,43 @@
+[tools]
+"cargo:https://github.com/burtonageo/cargo-bundle" = "rev:ae4c76e92c08774bf54ff077b1c52e3d1cd6c16d"
+gitleaks = "latest"
+protoc = "latest"
+trufflehog = "latest"
+
+# WarpBazinga dev rebuild loop. `mise run r` kills the running Warp build,
+# rebuilds + bundles via `./script/run --dont-open`, then launches the freshly
+# built bundle. The TERM override sidesteps the `Term(ColorOutOfRange)` panic
+# that `cargo-bundle` hits under Claude Code's pty.
+[tasks.r]
+description = "Rebuild + relaunch WarpOss for the experimental sidebar dev loop."
+run = """
+set -e
+pkill -f WarpOss 2>/dev/null || true
+pkill -f warp-oss 2>/dev/null || true
+sleep 1
+rm -f /tmp/claude/warp-run.log
+mkdir -p /tmp/claude
+TERM=xterm-256color NO_COLOR=1 ./script/run --dont-open 2>&1 | tee /tmp/claude/warp-run.log | tail -3
+open -b dev.warp.WarpOss
+"""
+
+# Capture a screenshot of display 2 (where WarpOss runs) and crop the sidebar
+# region. Output: /tmp/claude/screens/iter.png + /tmp/claude/screens/iter-sidebar.png.
+# Override the display with `mise run shot -- 1` for the built-in display.
+[tasks.shot]
+description = "Capture WarpOss screenshot + sidebar crop for the dev loop."
+run = """
+set -e
+mkdir -p /tmp/claude/screens
+# Probe available displays and capture each so the loop works whether the laptop is
+# docked (2 displays) or on the road (built-in only). Pick the one most likely to
+# have WarpOss by capturing all and reading them in order.
+displays=$(system_profiler SPDisplaysDataType 2>/dev/null | grep -c "Resolution" || echo 1)
+if [ "${displays:-1}" -ge 2 ]; then
+  screencapture -D 2 -x -o -t png /tmp/claude/screens/iter.png
+else
+  screencapture -D 1 -x -o -t png /tmp/claude/screens/iter.png
+fi
+sips --cropToHeightWidth 1200 1000 --cropOffset 200 0 /tmp/claude/screens/iter.png --out /tmp/claude/screens/iter-sidebar.png >/dev/null
+echo "Wrote /tmp/claude/screens/iter.png + /tmp/claude/screens/iter-sidebar.png"
+"""

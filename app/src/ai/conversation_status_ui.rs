@@ -9,6 +9,57 @@ use crate::ai::agent::conversation::ConversationStatus;
 use crate::ai::agent_conversations_model::AgentRunDisplayStatus;
 use crate::ui_components::icons::Icon;
 
+/// WarpBazinga state palette. Single edit point for every status color the
+/// sidebar surfaces: the row icon, the row tint, and the section header bar.
+/// Swap any color below to retheme; the rest of the sidebar follows.
+///
+/// Defaults use a Night Owl-inspired palette:
+/// * InProgress — `#82AAFF` (Night Owl blue), reads as "agent thinking" against
+///   the dark sidebar without clashing with theme ANSI colors.
+/// * Blocked    — `#FFAA5C` (warm orange), demands attention without screaming.
+/// * Error      — `#EF5350` (soft red), distinct from Blocked.
+/// * Cancelled  — `#7A8FAC` (cool gray), past-tense neutral.
+/// * Success    — `#C3E88D` (Night Owl green), done-but-quiet.
+/// * Idle       — `#637777` (Night Owl muted teal), fades into the surface.
+pub const BAZINGA_IN_PROGRESS_COLOR: ColorU = ColorU { r: 130, g: 170, b: 255, a: 255 };
+pub const BAZINGA_BLOCKED_COLOR: ColorU = ColorU { r: 255, g: 170, b: 92, a: 255 };
+pub const BAZINGA_ERROR_COLOR: ColorU = ColorU { r: 239, g: 83, b: 80, a: 255 };
+pub const BAZINGA_CANCELLED_COLOR: ColorU = ColorU { r: 122, g: 143, b: 172, a: 255 };
+pub const BAZINGA_SUCCESS_COLOR: ColorU = ColorU { r: 195, g: 232, b: 141, a: 255 };
+pub const BAZINGA_IDLE_COLOR: ColorU = ColorU { r: 99, g: 119, b: 119, a: 255 };
+
+/// WarpBazinga override: returns the icon + color the bazinga sidebar should use
+/// for a given `ConversationStatus`. Every status is remapped to the bazinga
+/// palette so the row icon, the row tint, and section accents all draw from the
+/// same source. Edit the `BAZINGA_*_COLOR` constants above to retheme.
+pub fn bazinga_status_icon_and_color(
+    status: &ConversationStatus,
+    theme: &WarpTheme,
+) -> (Icon, ColorU) {
+    let (icon, _) = status.status_icon_and_color(theme);
+    let color = match status {
+        ConversationStatus::InProgress => BAZINGA_IN_PROGRESS_COLOR,
+        ConversationStatus::Blocked { .. } => BAZINGA_BLOCKED_COLOR,
+        ConversationStatus::Error => BAZINGA_ERROR_COLOR,
+        ConversationStatus::Cancelled => BAZINGA_CANCELLED_COLOR,
+        ConversationStatus::Success => BAZINGA_SUCCESS_COLOR,
+    };
+    (icon, color)
+}
+
+/// WarpBazinga: neutral idle color used when no status is present (the hollow
+/// circle on a row that has no agent activity to report).
+pub fn bazinga_idle_color() -> ColorU {
+    BAZINGA_IDLE_COLOR
+}
+
+/// WarpBazinga: window during which a self-managed CLI agent (no statusline
+/// plugin) is treated as `InProgress` based on recent PTY wakeup activity.
+/// Wakeups are throttled, so this is conservatively larger than the throttle
+/// period to avoid flickering between InProgress and Idle while output streams.
+pub const BAZINGA_AGENT_ACTIVE_WINDOW_MS: u64 = 1_500;
+
+
 /// Padding around the status icon
 pub const STATUS_ELEMENT_PADDING: f32 = 2.;
 
@@ -68,26 +119,31 @@ pub fn render_state_only_icon(
 
 /// WarpBazinga: returns the row background tint for a given status as a low-opacity
 /// derivative of the status's foreground color. Returns `None` when the status
-/// should leave the row untinted (cancelled, idle), so callers can fall through
-/// to the default surface color.
+/// should leave the row untinted (cancelled, success, idle bucket), so callers
+/// can fall through to the default surface color and only the rows that need
+/// attention or are actively running pick up a tint.
 ///
 /// Opacity values are calibrated so the row reads as "grouped by state" without
 /// shouting. Blocked/Error get the strongest tint because they need attention;
-/// InProgress is subtler since running rows are common; Success is the lightest
-/// since done work shouldn't compete with active work.
+/// InProgress is subtler since running rows are common.
 pub fn status_tint_color(
-    status: &impl StatusElementStyle,
+    status: &ConversationStatus,
     theme: &WarpTheme,
 ) -> Option<ColorU> {
-    let (_, color) = status.status_icon_and_color(theme);
-    // 8% (Success) — 13% (Error) range. coloru_with_opacity takes 0..=100.
-    Some(coloru_with_opacity(color, status_tint_opacity_pct(color, theme)))
+    let opacity_pct = status_tint_opacity_pct(status)?;
+    let (_, color) = bazinga_status_icon_and_color(status, theme);
+    Some(coloru_with_opacity(color, opacity_pct))
 }
 
-/// Inner helper: pick an opacity percentage for a status color tint. Kept
-/// separate so it can be tuned without touching the wrapper.
-fn status_tint_opacity_pct(_color: ColorU, _theme: &WarpTheme) -> u8 {
-    // Uniform 10% for v1. Future: vary by ConversationStatus variant once the
-    // tint function takes the status itself rather than just the color.
-    10
+/// Inner helper: pick an opacity percentage for a status color tint, or `None`
+/// to leave the row untinted. Cancelled and Success render on the default
+/// surface so done/abandoned work doesn't compete with active work. InProgress
+/// is bumped to 18% so the streaming pink-purple actually reads against the
+/// dark sidebar background.
+fn status_tint_opacity_pct(status: &ConversationStatus) -> Option<u8> {
+    match status {
+        ConversationStatus::Blocked { .. } | ConversationStatus::Error => Some(18),
+        ConversationStatus::InProgress => Some(18),
+        ConversationStatus::Success | ConversationStatus::Cancelled => None,
+    }
 }

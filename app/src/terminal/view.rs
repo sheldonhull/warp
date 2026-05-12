@@ -373,6 +373,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -2857,6 +2858,19 @@ pub struct TerminalView {
     /// State handle for the shimmering text animation in the remote server loading footer.
     /// Persisted across renders so the animation doesn't restart.
     remote_server_shimmer_handle: ShimmeringTextStateHandle,
+
+    /// WarpBazinga: milliseconds-since-unix-epoch timestamp of the most recent
+    /// throttled terminal wakeup that came in *during a burst* of activity (a
+    /// follow-up wakeup arriving within `BAZINGA_BURST_WINDOW_MS` of a previous
+    /// wakeup). One-off wakeups (clicks, scrolls, focus changes, block-state
+    /// transitions) intentionally do not update this — they would otherwise
+    /// flicker the sidebar row between RUNNING and NEEDS ME every interaction.
+    last_wakeup_ms: Arc<AtomicU64>,
+    /// WarpBazinga: time of the most recent raw wakeup (any cause). Used only
+    /// to detect "burst" activity that confirms real PTY streaming; not
+    /// surfaced to consumers. Two wakeups within `BAZINGA_BURST_WINDOW_MS`
+    /// promote the latest one into `last_wakeup_ms`.
+    last_raw_wakeup_ms: Arc<AtomicU64>,
 }
 
 /// Parameters stashed when a code review pane open is requested with
@@ -4140,6 +4154,8 @@ impl TerminalView {
             focus_handle: None,
             sessions,
             remote_server_shimmer_handle: ShimmeringTextStateHandle::new(),
+            last_wakeup_ms: Arc::new(AtomicU64::new(0)),
+            last_raw_wakeup_ms: Arc::new(AtomicU64::new(0)),
             active_block_metadata: None,
             block_text_selection_start_position: None,
             background_executor: ctx.background_executor().clone(),
@@ -7605,6 +7621,22 @@ impl TerminalView {
             && !model.is_read_only()
     }
 
+    /// WarpBazinga: milliseconds elapsed since the most recent throttled terminal
+    /// wakeup, or `None` if no wakeup has been observed yet (terminal just opened).
+    /// Used as an activity proxy for self-managed CLI agents: when output stops
+    /// streaming, this value grows and the sidebar flips the row back to idle.
+    pub fn ms_since_last_wakeup(&self) -> Option<u64> {
+        let last = self.last_wakeup_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return None;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis() as u64;
+        Some(now.saturating_sub(last))
+    }
+
     /// Returns `true` when an interactive SSH command has been detected at
     /// preexec and the SSH block is still running (long-running). Used by
     /// the workspace to derive `PendingRemoteSession` without storing
@@ -8138,6 +8170,34 @@ impl TerminalView {
     /// This function is invoked every time there is some form of view event
     /// such as a state change or terminal wakeup to update the view context.
     fn handle_terminal_wakeup(&mut self, _: (), ctx: &mut ViewContext<Self>) {
+        // WarpBazinga: burst-detect PTY activity to drive the sidebar's
+        // "InProgress / Idle" signal for CLI agents without a statusline plugin.
+        // Wakeups fire for *many* reasons — PTY output, block-state transitions,
+        // scroll, focus, clicks — so a single wakeup is not a reliable "agent
+        // is streaming" signal. Real output streams produce many wakeups in
+        // rapid succession, so we only stamp `last_wakeup_ms` when this wakeup
+        // arrives within `BAZINGA_BURST_WINDOW_MS` of a previous one. Isolated
+        // wakeups (a click on the row, a scroll) bump `last_raw_wakeup_ms` but
+        // not `last_wakeup_ms`, leaving the sidebar state stable.
+        //
+        // We deliberately do NOT schedule an extra `ctx.notify()` here — a
+        // prior version did, and it appears to have raced with the terminal
+        // grid renderer (`render_grid_without_ligatures` OOB on `Row::index`).
+        // The row transitions back to Idle on the next natural re-render,
+        // which happens within a fraction of a second under typical UI
+        // activity.
+        const BAZINGA_BURST_WINDOW_MS: u64 = 500;
+        if let Ok(now_ms) = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+        {
+            let prev_raw = self.last_raw_wakeup_ms.swap(now_ms, Ordering::Relaxed);
+            let is_burst = prev_raw != 0 && now_ms.saturating_sub(prev_raw) <= BAZINGA_BURST_WINDOW_MS;
+            if is_burst {
+                self.last_wakeup_ms.store(now_ms, Ordering::Relaxed);
+            }
+        }
+
         // If find bar is active, we update the matches for the last/active block or the alt screen.
         if self.find_model.as_ref(ctx).is_find_bar_open() {
             self.find_model.update(ctx, |find_model, ctx| {
