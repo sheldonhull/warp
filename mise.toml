@@ -173,7 +173,8 @@ echo "✓ removed '$CERT' from login keychain (if present)"
 #   mise run warp:test:sidebar -- blocked  # session_start + permission_request
 #   mise run warp:test:sidebar -- question # session_start + question_asked
 #   mise run warp:test:sidebar -- stop     # session_start + stop
-#   mise run warp:test:sidebar -- error    # session_start + tool_complete err
+#   mise run warp:test:sidebar -- error    # session_start + tool_complete success:false
+#   mise run warp:test:sidebar -- cancelled# session_start + cancelled
 #   mise run warp:test:sidebar -- reset    # send stop to clear current SID
 #
 # session_id is reused across runs via /tmp/claude/warp-osc-sid so consecutive
@@ -217,7 +218,8 @@ case "$SCENARIO" in
   blocked)      emit session_start; sleep 0.2; emit permission_request tool_name:'\"Bash\"' summary:'\"approve test command?\"' ;;
   question)     emit session_start; sleep 0.2; emit question_asked summary:'\"pick an option\"' ;;
   stop)         emit session_start; sleep 0.2; emit stop response:'\"manual stop\"' ;;
-  error)        emit session_start; sleep 0.2; emit tool_complete tool_name:'\"Bash\"' summary:'\"failed\"' ;;
+  error)        emit session_start; sleep 0.2; emit tool_complete tool_name:'\"Bash\"' summary:'\"failed\"' success:false ;;
+  cancelled)    emit session_start; sleep 0.2; emit cancelled reason:'\"prompt_input_exit\"' ;;
   full|"")
     emit session_start
     sleep 1; echo "→ IDLE (no status yet); SID=$SID" >&2
@@ -230,7 +232,7 @@ case "$SCENARIO" in
     emit stop response:'\"full sequence done\"'
     echo "→ SUCCESS (green) then IDLE" >&2
     ;;
-  *) echo "usage: mise run warp:test:sidebar -- [full|start|running|blocked|question|stop|error|reset]" >&2; exit 2 ;;
+  *) echo "usage: mise run warp:test:sidebar -- [full|start|running|blocked|question|stop|error|cancelled|reset]" >&2; exit 2 ;;
 esac
 """
 

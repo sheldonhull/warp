@@ -157,6 +157,14 @@ impl AgentNotificationsModel {
                         ctx,
                     );
                 }
+                CLIAgentSessionStatus::Error { .. } | CLIAgentSessionStatus::Cancelled { .. } => {
+                    // Terminal failure/cancel states: clear stale "needs attention"
+                    // notifications so the row doesn't keep flashing after the run ended.
+                    self.remove_notification_by_source(
+                        NotificationOrigin::CLISession(*terminal_view_id),
+                        ctx,
+                    );
+                }
                 CLIAgentSessionStatus::Success => {
                     let title = session_context
                         .display_title()

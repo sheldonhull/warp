@@ -211,6 +211,25 @@ fn parse_tool_complete_notification() {
 }
 
 #[test]
+fn parse_tool_complete_failure_notification() {
+    let body = r#"{"v":1,"agent":"claude","event":"tool_complete","session_id":"abc","cwd":"/tmp/proj","tool_name":"Bash","success":false,"summary":"exit 1"}"#;
+    let notif = parse_event(Some("warp://cli-agent"), body).unwrap();
+
+    assert_eq!(notif.event, CLIAgentEventType::ToolComplete);
+    assert_eq!(notif.payload.success, Some(false));
+    assert_eq!(notif.payload.summary.as_deref(), Some("exit 1"));
+}
+
+#[test]
+fn parse_cancelled_notification() {
+    let body = r#"{"v":1,"agent":"claude","event":"cancelled","session_id":"abc","cwd":"/tmp/proj","reason":"prompt_input_exit"}"#;
+    let notif = parse_event(Some("warp://cli-agent"), body).unwrap();
+
+    assert_eq!(notif.event, CLIAgentEventType::Cancelled);
+    assert_eq!(notif.payload.reason.as_deref(), Some("prompt_input_exit"));
+}
+
+#[test]
 fn parse_auggie_stop_notification() {
     // Mirrors what the community auggie-warp plugin emits on the Stop hook.
     let body = r#"{"v":1,"agent":"auggie","event":"stop","session_id":"abc","cwd":"/tmp/proj","project":"proj","query":"write a haiku","response":"Memory is safe"}"#;

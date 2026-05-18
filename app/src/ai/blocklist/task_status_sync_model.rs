@@ -323,6 +323,14 @@ fn map_cli_session_status(
     match status {
         CLIAgentSessionStatus::InProgress => (AgentTaskState::InProgress, None),
         CLIAgentSessionStatus::Success => (AgentTaskState::Succeeded, None),
+        CLIAgentSessionStatus::Error { message } => (
+            AgentTaskState::Error,
+            message.as_ref().map(TaskStatusUpdate::message),
+        ),
+        CLIAgentSessionStatus::Cancelled { reason } => (
+            AgentTaskState::Cancelled,
+            reason.as_ref().map(TaskStatusUpdate::message),
+        ),
         CLIAgentSessionStatus::Blocked { message } => (
             AgentTaskState::Blocked,
             message.as_ref().map(TaskStatusUpdate::message),

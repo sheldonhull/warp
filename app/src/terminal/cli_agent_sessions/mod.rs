@@ -18,6 +18,8 @@ use event::{CLIAgentEvent, CLIAgentEventType};
 pub enum CLIAgentSessionStatus {
     InProgress,
     Success,
+    Error { message: Option<String> },
+    Cancelled { reason: Option<String> },
     Blocked { message: Option<String> },
 }
 
@@ -27,6 +29,8 @@ impl CLIAgentSessionStatus {
         match self {
             CLIAgentSessionStatus::InProgress => ConversationStatus::InProgress,
             CLIAgentSessionStatus::Success => ConversationStatus::Success,
+            CLIAgentSessionStatus::Error { .. } => ConversationStatus::Error,
+            CLIAgentSessionStatus::Cancelled { .. } => ConversationStatus::Cancelled,
             CLIAgentSessionStatus::Blocked { message } => ConversationStatus::Blocked {
                 blocked_action: message.clone().unwrap_or_default(),
             },
@@ -180,10 +184,29 @@ impl CLIAgentSession {
                 CLIAgentSessionStatus::InProgress
             }
             CLIAgentEventType::ToolComplete => {
-                if !matches!(self.status, CLIAgentSessionStatus::Blocked { .. }) {
-                    return None;
+                if event.payload.success == Some(false) {
+                    // Tool failed — surface as Error regardless of prior state so
+                    // PostToolUseFailure can transition out of InProgress, Blocked,
+                    // or anything else the session is currently sitting in.
+                    self.clear_permission_scoped_state();
+                    let message = event
+                        .payload
+                        .summary
+                        .clone()
+                        .or_else(|| event.payload.tool_name.clone());
+                    CLIAgentSessionStatus::Error { message }
+                } else {
+                    if !matches!(self.status, CLIAgentSessionStatus::Blocked { .. }) {
+                        return None;
+                    }
+                    CLIAgentSessionStatus::InProgress
                 }
-                CLIAgentSessionStatus::InProgress
+            }
+            CLIAgentEventType::Cancelled => {
+                self.clear_permission_scoped_state();
+                CLIAgentSessionStatus::Cancelled {
+                    reason: event.payload.reason.clone(),
+                }
             }
             CLIAgentEventType::Stop => {
                 self.session_context.query = event.payload.query.clone();

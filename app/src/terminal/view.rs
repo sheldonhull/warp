@@ -12749,8 +12749,13 @@ impl TerminalView {
                             ctx,
                         );
                     }
-                    CLIAgentSessionStatus::InProgress | CLIAgentSessionStatus::Success => {
-                        // Auto-open rich input when the agent resumes or completes.
+                    CLIAgentSessionStatus::InProgress
+                    | CLIAgentSessionStatus::Success
+                    | CLIAgentSessionStatus::Error { .. }
+                    | CLIAgentSessionStatus::Cancelled { .. } => {
+                        // Auto-open rich input when the agent resumes, completes,
+                        // errors out, or is cancelled — all terminal/idle states
+                        // where the user is the next actor.
                         if !self.has_active_cli_agent_input_session(ctx) {
                             self.open_cli_agent_rich_input(CLIAgentInputEntrypoint::AutoShow, ctx);
                         }
@@ -12773,10 +12778,13 @@ impl TerminalView {
             .or(session_context.summary.as_deref().filter(|s| !s.is_empty()))
             .unwrap_or(agent.command_prefix())
             .to_owned();
-        let description = if let CLIAgentSessionStatus::Blocked { message } = status {
-            message.clone().unwrap_or_default()
-        } else {
-            session_context.response.clone().unwrap_or_default()
+        let description = match status {
+            CLIAgentSessionStatus::Blocked { message }
+            | CLIAgentSessionStatus::Error { message } => message.clone().unwrap_or_default(),
+            CLIAgentSessionStatus::Cancelled { reason } => reason
+                .clone()
+                .unwrap_or_else(|| "Cancelled by user".to_owned()),
+            _ => session_context.response.clone().unwrap_or_default(),
         };
 
         let trigger = if matches!(status, CLIAgentSessionStatus::Blocked { .. }) {

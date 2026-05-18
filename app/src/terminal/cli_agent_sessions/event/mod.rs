@@ -22,6 +22,7 @@ pub enum CLIAgentEventType {
     PermissionReplied,
     QuestionAsked,
     IdlePrompt,
+    Cancelled,
     Unknown(String),
 }
 
@@ -36,6 +37,13 @@ pub struct CLIAgentEventPayload {
     pub tool_name: Option<String>,
     pub tool_input_preview: Option<String>,
     pub plugin_version: Option<String>,
+    /// PostToolUse / PostToolUseFailure result indicator. `Some(false)` means
+    /// the tool failed (transition session to `Error`); `Some(true)` or `None`
+    /// preserve the prior behavior of simply leaving the Blocked state.
+    pub success: Option<bool>,
+    /// SessionEnd reason ("prompt_input_exit", "logout", "clear", "other"),
+    /// surfaced via the `cancelled` event so the UI can attribute the stop.
+    pub reason: Option<String>,
 }
 
 /// A parsed event from a CLI agent plugin.
