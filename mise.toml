@@ -17,7 +17,7 @@ trufflehog = "latest"
 #   4. mise itself installs cargo-bundle + protoc on `mise install` (declared
 #      under [tools] above).
 [tasks.setup]
-description = "One-time bootstrap (Xcode check + Metal Toolchain + dev cert)."
+description = "One-time bootstrap: Xcode check, brew prereqs, Metal Toolchain, dev cert, claude-code-warp pointer instructions."
 depends = ["cert:create"]
 run = """
 set -euo pipefail
@@ -26,17 +26,71 @@ set -euo pipefail
 DEV_DIR="$(xcode-select -p 2>/dev/null || true)"
 if [ -z "$DEV_DIR" ] || [ "$DEV_DIR" = "/Library/Developer/CommandLineTools" ]; then
   echo "✗ xcode-select is pointed at Command Line Tools or unset." >&2
-  echo "  Install Xcode.app from the App Store or developer.apple.com, then:" >&2
+  echo "  Install Xcode.app from the App Store, then switch:" >&2
+  echo "    open 'macappstore://itunes.apple.com/app/xcode/id497799835'" >&2
   echo "    sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer" >&2
+  printf '  Open the App Store page for Xcode now? [y/N] ' >&2
+  read -r ans
+  case "$ans" in
+    y|Y) open 'macappstore://itunes.apple.com/app/xcode/id497799835' ;;
+  esac
   exit 1
 fi
 echo "✓ xcode-select: $DEV_DIR"
+
+# ---- Homebrew prereqs (jq for plugin hooks; codesign already ships with macOS) ----
+if ! command -v brew >/dev/null 2>&1; then
+  echo "✗ Homebrew not installed." >&2
+  echo "  Install: /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"" >&2
+  exit 1
+fi
+echo "✓ brew: $(brew --prefix)"
+for pkg in jq; do
+  if brew list --formula "$pkg" >/dev/null 2>&1; then
+    echo "✓ brew package: $pkg"
+  else
+    echo "→ installing brew package: $pkg"
+    brew install "$pkg"
+  fi
+done
 
 if xcrun --find metal >/dev/null 2>&1 && xcrun metal --version >/dev/null 2>&1; then
   echo "✓ Metal Toolchain present"
 else
   echo "→ Downloading Metal Toolchain (~700 MB, idempotent)…"
   xcodebuild -downloadComponent MetalToolchain
+fi
+
+# ---- claude-code-warp plugin pointer (fork ref) ----
+# Bazinga status-mapping hooks (PreToolUse AskUserQuestion, SessionEnd→cancelled,
+# PostToolUseFailure→Error) live on sheldonhull/claude-code-warp's
+# feat/improve-claude-status-mapping branch. Upstream warpdotdev/main lacks
+# them, so the sidebar can't transition out of IDLE on those events when the
+# stock plugin is loaded.
+SETTINGS="$HOME/.claude/settings.json"
+if [ -f "$SETTINGS" ]; then
+  if grep -q '"sheldonhull/claude-code-warp"' "$SETTINGS"; then
+    echo "✓ ~/.claude/settings.json already points at sheldonhull/claude-code-warp fork"
+  else
+    cat >&2 <<'HINT'
+ℹ ~/.claude/settings.json does NOT point at the fork. To consume the bazinga
+  status-mapping hooks, edit the file's extraKnownMarketplaces.claude-code-warp
+  entry to:
+
+    "claude-code-warp": {
+      "source": {
+        "source": "github",
+        "repo": "sheldonhull/claude-code-warp",
+        "ref": "feat/improve-claude-status-mapping"
+      }
+    }
+
+  Then restart Claude Code (do NOT /reload-plugins — it strips the ref field).
+  If you manage settings via chezmoi, edit the template instead.
+HINT
+  fi
+else
+  echo "ℹ ~/.claude/settings.json missing — install Claude Code first, then re-run setup." >&2
 fi
 
 echo "✓ setup complete. Run \\`mise run r\\` to build + launch WarpOss."
