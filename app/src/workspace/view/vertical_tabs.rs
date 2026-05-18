@@ -1759,6 +1759,10 @@ fn render_groups(
 
         // Build a sortable list. Preserve original tab ordering inside each (section, group)
         // bucket so the user's manual ordering isn't completely shuffled.
+        // (section, _unused_group_placeholder, tab_idx, filtered_pane_ids, original_visible_idx).
+        // The group string is kept in the tuple for now to minimize churn against
+        // the in-flight user-defined project-grouping work; it's no longer used
+        // for sorting or header rendering.
         let mut rows: Vec<(BazingaSec, String, usize, Option<Vec<PaneId>>, usize)> =
             visible_tabs
                 .iter()
@@ -1766,21 +1770,20 @@ fn render_groups(
                 .map(|(vidx, (tab_idx, fpids))| {
                     (
                         classify(*tab_idx),
-                        bazinga_tab_group_name(&workspace.tabs[*tab_idx], app),
+                        String::new(),
                         *tab_idx,
                         fpids.clone(),
                         vidx,
                     )
                 })
                 .collect();
-        rows.sort_by_key(|(sec, group, _, _, vidx)| {
+        rows.sort_by_key(|(sec, _, _, _, vidx)| {
             (
                 match sec {
                     BazingaSec::NeedsMe => 0u8,
                     BazingaSec::Running => 1,
                     BazingaSec::Idle => 2,
                 },
-                group.clone(),
                 *vidx,
             )
         });
@@ -1808,17 +1811,13 @@ fn render_groups(
                 count > 0,
                 app,
             ));
-            let mut last_group: Option<String> = None;
+            // WarpBazinga: flat list within each state section. cwd-basename
+            // sub-grouping removed — the right grouping abstraction is a
+            // user-defined "project" (drag-to-group, persisted in tab metadata),
+            // tracked separately. Rows still sort by their original visible
+            // index inside the bucket so manual ordering is preserved.
             for (i_in_rows, _) in &section_rows {
-                let (_, group, tab_idx, fpids, _vidx) = rows[*i_in_rows].clone();
-                if last_group.as_ref() != Some(&group) {
-                    let group_count = rows[*i_in_rows..]
-                        .iter()
-                        .take_while(|r| r.0 == sec_enum && r.1 == group)
-                        .count();
-                    groups.add_child(render_bazinga_group_header(&group, group_count, app));
-                    last_group = Some(group.clone());
-                }
+                let (_, _group, tab_idx, fpids, _vidx) = rows[*i_in_rows].clone();
                 if ghost_insertion_index == Some(tab_idx) {
                     groups.add_child(render_ghost_vertical_tab_slot(workspace, app));
                 }
@@ -1986,6 +1985,11 @@ fn render_bazinga_section_header(
 /// WarpBazinga: derive a human-readable group name for a tab from the first pane
 /// that has a local cwd. Uses the cwd's basename. Falls back to "Other" when no
 /// pane in the tab exposes a local cwd.
+///
+/// Currently unused — kept as a seed for the upcoming user-defined project
+/// grouping work (the "Unassigned → drag to project" flow), where cwd basename
+/// is the most useful initial label suggestion.
+#[allow(dead_code)]
 fn bazinga_tab_group_name(tab: &TabData, app: &AppContext) -> String {
     let pane_group = tab.pane_group.as_ref(app);
     for pid in pane_group.visible_pane_ids() {
@@ -2003,6 +2007,10 @@ fn bazinga_tab_group_name(tab: &TabData, app: &AppContext) -> String {
 
 /// WarpBazinga: render the small uppercase group label that introduces a cluster of
 /// tabs sharing a cwd. Visual contract: 10px, sub-text color, padded.
+///
+/// Currently unused (flat list within each state section). Kept for the
+/// upcoming user-defined project grouping work.
+#[allow(dead_code)]
 fn render_bazinga_group_header(name: &str, count: usize, app: &AppContext) -> Box<dyn Element> {
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();

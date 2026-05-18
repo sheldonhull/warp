@@ -5,11 +5,16 @@ protoc = "latest"
 trufflehog = "latest"
 
 # WarpBazinga dev rebuild loop. `mise run r` kills the running Warp build,
-# rebuilds + bundles via `./script/run --dont-open`, then launches the freshly
+# rebuilds + bundles via `./script/run --dont-open`, re-signs the bundle with a
+# stable dev cert so TCC grants survive rebuilds, then launches the freshly
 # built bundle. The TERM override sidesteps the `Term(ColorOutOfRange)` panic
 # that `cargo-bundle` hits under Claude Code's pty.
+#
+# Override the signing identity by setting `WARP_DEV_CERT` (defaults to
+# `Scry Dev`). The cert must be in your login keychain, valid for code-signing,
+# and have `/usr/bin/codesign` listed in its ACL so re-signs run silently.
 [tasks.r]
-description = "Rebuild + relaunch WarpOss for the experimental sidebar dev loop."
+description = "Rebuild + re-sign + relaunch WarpOss for the dev loop."
 run = """
 set -e
 pkill -f WarpOss 2>/dev/null || true
@@ -18,7 +23,102 @@ sleep 1
 rm -f /tmp/claude/warp-run.log
 mkdir -p /tmp/claude
 TERM=xterm-256color NO_COLOR=1 ./script/run --dont-open 2>&1 | tee /tmp/claude/warp-run.log | tail -3
-open -b dev.warp.WarpOss
+APP="target/debug/bundle/osx/WarpOss.app"
+CERT="${WARP_DEV_CERT:-Warp Dev}"
+# Re-sign the bundle with a stable dev cert so the designated requirement
+# pins to the cert leaf instead of the per-build cdhash. macOS TCC keys
+# permission grants on the DR, so this keeps Accessibility / Screen Capture /
+# Apple Events grants alive across rebuilds. Falls back to the upstream
+# ad-hoc signature if the cert isn't available.
+if security find-certificate -c "$CERT" >/dev/null 2>&1; then
+  codesign --force --deep --sign "$CERT" --timestamp=none "$APP"
+  DR=$(codesign -d -r- "$APP" 2>&1 | grep designated || true)
+  case "$DR" in
+    *'cdhash H"'*) echo "warn: DR still cdhash-pinned, TCC grants will reset" >&2 ;;
+  esac
+else
+  echo "warn: cert '$CERT' missing in keychain; bundle stays ad-hoc signed" >&2
+fi
+# Detach launch from the terminal process tree via launchctl asuser. Without
+# this, TCC attaches the Accessibility / Screen Capture grants to whatever
+# parent process triggered the prompt (mise, Warp, Claude Code), so every new
+# terminal session re-prompts even when the bundle's signature is stable.
+launchctl asuser "$(id -u)" open -b dev.warp.WarpOss
+"""
+
+# One-time bootstrap: generate a self-signed `Warp Dev` cert in the login
+# keychain if one doesn't exist. Imports as a PKCS12 bundle with a friendly
+# name so the keychain prompt reads "Warp Dev" (instead of generic "key").
+# Pre-grants `/usr/bin/codesign` ACL so the re-sign in `mise run r` runs
+# without a keychain prompt. Set `WARP_DEV_CERT` to use a different identity.
+[tasks."cert:create"]
+description = "Create a self-signed code-signing cert for the dev rebuild loop."
+run = """
+set -euo pipefail
+CERT="${WARP_DEV_CERT:-Warp Dev}"
+LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+
+# Treat an existing identity (cert + matching private key) as a no-op. A bare
+# cert without a key isn't usable for signing — fall through to the recreate
+# path in that case.
+if security find-identity -p codesigning -v "$LOGIN_KEYCHAIN" 2>/dev/null \\
+     | grep -F "$CERT" >/dev/null; then
+  echo "✓ identity '$CERT' already in login keychain"
+  exit 0
+fi
+
+# Clean up any stale half-imports left from a previous failed run so the new
+# import doesn't trip 'errSecDuplicateItem' / 'errSecInternalComponent'.
+security delete-identity -c "$CERT" "$LOGIN_KEYCHAIN" >/dev/null 2>&1 || true
+security delete-certificate -c "$CERT" "$LOGIN_KEYCHAIN" >/dev/null 2>&1 || true
+
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+cat > "$TMP/cert.conf" << CONF
+[req]
+prompt             = no
+distinguished_name = dn
+x509_extensions    = v3_req
+[dn]
+CN = $CERT
+[v3_req]
+keyUsage             = critical, digitalSignature
+extendedKeyUsage     = critical, codeSigning
+basicConstraints     = critical, CA:FALSE
+subjectKeyIdentifier = hash
+CONF
+openssl genrsa -out "$TMP/key.pem" 2048 2>/dev/null
+openssl req -x509 -key "$TMP/key.pem" -sha256 -days 3650 \\
+  -out "$TMP/cert.pem" -config "$TMP/cert.conf" 2>/dev/null
+
+# Bundle into PKCS12 with -name so the keychain assigns a human label to the
+# private key. Without this, the entry shows up as the unlabeled string "key"
+# in the keychain access prompt — fine functionally, but confusing when
+# multiple dev certs share the keychain. `-legacy` forces SHA1/3DES PBE+MAC
+# algorithms; macOS Security framework rejects OpenSSL 3's default AES-256+
+# SHA-256 PBE bundle with "MAC verification failed".
+# Use macOS's system LibreSSL for the PKCS12 export — Homebrew's OpenSSL 3
+# defaults to algorithms `security import` rejects with "MAC verification
+# failed" even with `-legacy`. LibreSSL emits a bundle the keychain accepts.
+/usr/bin/openssl pkcs12 -export \\
+  -inkey "$TMP/key.pem" -in "$TMP/cert.pem" \\
+  -name "$CERT" -passout pass:warpdev -out "$TMP/cert.p12"
+security import "$TMP/cert.p12" -k "$LOGIN_KEYCHAIN" -P "warpdev" \\
+  -T /usr/bin/codesign -T /usr/bin/security
+
+echo "✓ created. First codesign run will prompt the keychain once for '$CERT' — click 'Always Allow'."
+"""
+
+# Remove the dev signing cert + private key from the login keychain. Useful
+# when rotating, or to clean up half-imports from a failed `cert:create`.
+[tasks."cert:reset"]
+description = "Delete the dev signing cert + key from the login keychain."
+run = """
+set -euo pipefail
+CERT="${WARP_DEV_CERT:-Warp Dev}"
+LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+security delete-identity -c "$CERT" "$LOGIN_KEYCHAIN" >/dev/null 2>&1 || true
+security delete-certificate -c "$CERT" "$LOGIN_KEYCHAIN" >/dev/null 2>&1 || true
+echo "✓ removed '$CERT' from login keychain (if present)"
 """
 
 # Capture a screenshot of display 2 (where WarpOss runs) and crop the sidebar
