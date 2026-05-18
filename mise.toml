@@ -160,6 +160,80 @@ security delete-certificate -c "$CERT" "$LOGIN_KEYCHAIN" >/dev/null 2>&1 || true
 echo "✓ removed '$CERT' from login keychain (if present)"
 """
 
+# Drive the WarpBazinga sidebar through real OSC 777 `warp://cli-agent` events
+# from inside a warp-oss tab. Run this in the tab whose sidebar row you want
+# to inspect. The warp@claude-code-warp plugin emits these events during real
+# Claude sessions; this task lets you exercise each state without waiting for
+# a real session to hit each transition.
+#
+#   mise run warp:test:sidebar             # full sequence: start → running →
+#                                          # blocked → success
+#   mise run warp:test:sidebar -- start    # session_start only
+#   mise run warp:test:sidebar -- running  # session_start + prompt_submit
+#   mise run warp:test:sidebar -- blocked  # session_start + permission_request
+#   mise run warp:test:sidebar -- question # session_start + question_asked
+#   mise run warp:test:sidebar -- stop     # session_start + stop
+#   mise run warp:test:sidebar -- error    # session_start + tool_complete err
+#   mise run warp:test:sidebar -- reset    # send stop to clear current SID
+#
+# session_id is reused across runs via /tmp/claude/warp-osc-sid so consecutive
+# scenarios apply to the same session. `reset` clears it.
+[tasks."warp:test:sidebar"]
+description = "Drive the bazinga sidebar through OSC 777 events for manual state testing."
+run = """
+set -u
+SCENARIO="${1:-full}"
+SID_FILE="/tmp/claude/warp-osc-sid"
+mkdir -p /tmp/claude
+SID="$(cat "$SID_FILE" 2>/dev/null || true)"
+if [ -z "$SID" ]; then
+  SID="manual-$$-$(date +%s)"
+  echo "$SID" > "$SID_FILE"
+fi
+CWD="$PWD"
+PLUG="warp-bazinga-dev-1"
+
+emit() {
+  local event="$1"; shift
+  local extra=""
+  while [ $# -gt 0 ]; do extra+=",$1"; shift; done
+  local body
+  body=$(jq -nc \\
+    --argjson v 1 --arg agent "claude" --arg event "$event" \\
+    --arg sid "$SID" --arg cwd "$CWD" --arg plug "$PLUG" \\
+    "{v:\\$v, agent:\\$agent, event:\\$event, session_id:\\$sid, cwd:\\$cwd, plugin_version:\\$plug${extra:+, ${extra#,}}}")
+  printf '\\033]777;notify;warp://cli-agent;%s\\a' "$body"
+  echo "  → $event ($body)" >&2
+}
+
+case "$SCENARIO" in
+  reset)
+    emit stop response:'\"reset\"'
+    rm -f "$SID_FILE"
+    echo "↺ session reset (next run picks a fresh SID)" >&2
+    ;;
+  start)        emit session_start ;;
+  running)      emit session_start; sleep 0.2; emit prompt_submit query:'\"streaming test\"' ;;
+  blocked)      emit session_start; sleep 0.2; emit permission_request tool_name:'\"Bash\"' summary:'\"approve test command?\"' ;;
+  question)     emit session_start; sleep 0.2; emit question_asked summary:'\"pick an option\"' ;;
+  stop)         emit session_start; sleep 0.2; emit stop response:'\"manual stop\"' ;;
+  error)        emit session_start; sleep 0.2; emit tool_complete tool_name:'\"Bash\"' summary:'\"failed\"' ;;
+  full|"")
+    emit session_start
+    sleep 1; echo "→ IDLE (no status yet); SID=$SID" >&2
+    emit prompt_submit query:'\"full-sequence streaming\"'
+    echo "→ RUNNING (blue)" >&2
+    sleep 3
+    emit permission_request tool_name:'\"Bash\"' summary:'\"approve full-sequence?\"'
+    echo "→ NEEDS ME (orange)" >&2
+    sleep 3
+    emit stop response:'\"full sequence done\"'
+    echo "→ SUCCESS (green) then IDLE" >&2
+    ;;
+  *) echo "usage: mise run warp:test:sidebar -- [full|start|running|blocked|question|stop|error|reset]" >&2; exit 2 ;;
+esac
+"""
+
 # Capture a screenshot of display 2 (where WarpOss runs) and crop the sidebar
 # region. Output: /tmp/claude/screens/iter.png + /tmp/claude/screens/iter-sidebar.png.
 # Override the display with `mise run shot -- 1` for the built-in display.
