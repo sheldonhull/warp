@@ -163,19 +163,41 @@ echo "✓ removed '$CERT' from login keychain (if present)"
 # Drive the WarpBazinga sidebar through real OSC 777 `warp://cli-agent` events
 # from inside a warp-oss tab. Run this in the tab whose sidebar row you want
 # to inspect. The warp@claude-code-warp plugin emits these events during real
-# Claude sessions; this task lets you exercise each state without waiting for
-# a real session to hit each transition.
+# Claude sessions; this task exercises each state without waiting for a real
+# session to hit each transition.
 #
-#   mise run warp:test:sidebar             # full sequence: start → running →
-#                                          # blocked → success
-#   mise run warp:test:sidebar -- start    # session_start only
-#   mise run warp:test:sidebar -- running  # session_start + prompt_submit
-#   mise run warp:test:sidebar -- blocked  # session_start + permission_request
-#   mise run warp:test:sidebar -- question # session_start + question_asked
-#   mise run warp:test:sidebar -- stop     # session_start + stop
-#   mise run warp:test:sidebar -- error    # session_start + tool_complete success:false
-#   mise run warp:test:sidebar -- cancelled# session_start + cancelled
-#   mise run warp:test:sidebar -- reset    # send stop to clear current SID
+# Bucket coverage (every CLIAgentSessionStatus reachable):
+#   InProgress (RUNNING)  → running, tool_success
+#   Success    (DONE)     → stop
+#   Error      (FAILED)   → error
+#   Cancelled             → cancelled
+#   Blocked    (NEEDS ME) → blocked, question, perm_granted (transient)
+#   (no-op)               → idle, start
+#
+# mise's `run = """..."""` invocation swallows args passed after `--` (the
+# script runs under `sh -c` with no positional args), so the scenario name is
+# passed via the SCENARIO env var.
+#
+# Per-state quick scenarios:
+#   SCENARIO=start         mise run warp:test:sidebar    # (no status)
+#   SCENARIO=running       mise run warp:test:sidebar    # → InProgress
+#   SCENARIO=blocked       mise run warp:test:sidebar    # → Blocked (NEEDS ME)
+#   SCENARIO=question      mise run warp:test:sidebar    # → Blocked (NEEDS ME)
+#   SCENARIO=stop          mise run warp:test:sidebar    # → Success
+#   SCENARIO=error         mise run warp:test:sidebar    # → Error
+#   SCENARIO=cancelled     mise run warp:test:sidebar    # → Cancelled
+#   SCENARIO=idle          mise run warp:test:sidebar    # idle_prompt (no-op confirmation)
+#
+# Transition scenarios (Blocked → ?):
+#   SCENARIO=perm_granted  mise run warp:test:sidebar    # blocked → tool_complete success:true → InProgress
+#   SCENARIO=perm_replied  mise run warp:test:sidebar    # blocked → permission_replied → InProgress
+#   SCENARIO=recover_error mise run warp:test:sidebar    # error → prompt_submit → InProgress
+#
+# Sequences:
+#   mise run warp:test:sidebar                           # full walk (default)
+#   SCENARIO=cycle         mise run warp:test:sidebar    # rapid cycle through all 5 statuses
+#   SCENARIO=reset         mise run warp:test:sidebar    # clear current SID
+#   SCENARIO=list          mise run warp:test:sidebar    # print scenarios + status mapping
 #
 # session_id is reused across runs via /tmp/claude/warp-osc-sid so consecutive
 # scenarios apply to the same session. `reset` clears it.
@@ -183,7 +205,7 @@ echo "✓ removed '$CERT' from login keychain (if present)"
 description = "Drive the bazinga sidebar through OSC 777 events for manual state testing."
 run = """
 set -u
-SCENARIO="${1:-full}"
+SCENARIO="${SCENARIO:-${1:-full}}"
 SID_FILE="/tmp/claude/warp-osc-sid"
 mkdir -p /tmp/claude
 SID="$(cat "$SID_FILE" 2>/dev/null || true)"
@@ -208,18 +230,79 @@ emit() {
 }
 
 case "$SCENARIO" in
+  list)
+    printf "%s\n" \
+      "warp:test:sidebar scenarios - every CLIAgentSessionStatus reachable" \
+      "" \
+      "per-state:" \
+      "  start         session_start                                  -> (no status)" \
+      "  running       prompt_submit                                  -> InProgress" \
+      "  blocked       permission_request                             -> Blocked (NEEDS ME)" \
+      "  question      question_asked                                 -> Blocked (NEEDS ME)" \
+      "  stop          stop                                           -> Success" \
+      "  error         tool_complete success:false                    -> Error" \
+      "  cancelled     cancelled                                      -> Cancelled" \
+      "  idle          idle_prompt                                    -> (no-op)" \
+      "" \
+      "transitions:" \
+      "  perm_granted  blocked -> tool_complete success:true          -> InProgress" \
+      "  perm_replied  blocked -> permission_replied                  -> InProgress" \
+      "  recover_error error   -> prompt_submit                       -> InProgress" \
+      "" \
+      "sequences:" \
+      "  full          start->running->blocked->success" \
+      "  cycle         InProgress->Blocked->Error->Cancelled->Success" \
+      "  reset         clear SID file"
+    ;;
   reset)
     emit stop response:'\"reset\"'
     rm -f "$SID_FILE"
     echo "↺ session reset (next run picks a fresh SID)" >&2
     ;;
-  start)        emit session_start ;;
-  running)      emit session_start; sleep 0.2; emit prompt_submit query:'\"streaming test\"' ;;
-  blocked)      emit session_start; sleep 0.2; emit permission_request tool_name:'\"Bash\"' summary:'\"approve test command?\"' ;;
-  question)     emit session_start; sleep 0.2; emit question_asked summary:'\"pick an option\"' ;;
-  stop)         emit session_start; sleep 0.2; emit stop response:'\"manual stop\"' ;;
-  error)        emit session_start; sleep 0.2; emit tool_complete tool_name:'\"Bash\"' summary:'\"failed\"' success:false ;;
-  cancelled)    emit session_start; sleep 0.2; emit cancelled reason:'\"prompt_input_exit\"' ;;
+  start)         emit session_start ;;
+  running)       emit session_start; sleep 0.2; emit prompt_submit query:'\"streaming test\"' ;;
+  blocked)       emit session_start; sleep 0.2; emit permission_request tool_name:'\"Bash\"' summary:'\"approve test command?\"' ;;
+  question)      emit session_start; sleep 0.2; emit question_asked summary:'\"pick an option\"' ;;
+  stop)          emit session_start; sleep 0.2; emit stop response:'\"manual stop\"' ;;
+  error)         emit session_start; sleep 0.2; emit tool_complete tool_name:'\"Bash\"' summary:'\"failed\"' success:false ;;
+  cancelled)     emit session_start; sleep 0.2; emit cancelled reason:'\"prompt_input_exit\"' ;;
+  idle)          emit session_start; sleep 0.2; emit idle_prompt summary:'\"waiting for input\"' ;;
+  perm_granted)
+    emit session_start
+    sleep 0.2
+    emit permission_request tool_name:'\"Bash\"' summary:'\"approve ls -la?\"'
+    echo "→ Blocked (NEEDS ME)" >&2
+    sleep 2
+    emit tool_complete tool_name:'\"Bash\"' success:true
+    echo "→ InProgress (RUNNING) after grant" >&2
+    ;;
+  perm_replied)
+    emit session_start
+    sleep 0.2
+    emit permission_request tool_name:'\"Bash\"' summary:'\"approve ls -la?\"'
+    echo "→ Blocked (NEEDS ME)" >&2
+    sleep 2
+    emit permission_replied
+    echo "→ InProgress (RUNNING) after reply" >&2
+    ;;
+  recover_error)
+    emit session_start
+    sleep 0.2
+    emit tool_complete tool_name:'\"Bash\"' summary:'\"failed\"' success:false
+    echo "→ Error (FAILED)" >&2
+    sleep 2
+    emit prompt_submit query:'\"retry\"'
+    echo "→ InProgress (RUNNING) after retry prompt" >&2
+    ;;
+  cycle)
+    emit session_start;        sleep 0.6
+    emit prompt_submit query:'\"cycle start\"';                       echo "→ InProgress" >&2; sleep 1
+    emit permission_request tool_name:'\"Bash\"' summary:'\"cycle\"'; echo "→ Blocked"    >&2; sleep 1
+    emit tool_complete tool_name:'\"Bash\"' summary:'\"err\"' success:false; echo "→ Error" >&2; sleep 1
+    emit cancelled reason:'\"prompt_input_exit\"';                    echo "→ Cancelled" >&2; sleep 1
+    emit prompt_submit query:'\"resume\"';                            echo "→ InProgress" >&2; sleep 1
+    emit stop response:'\"cycle done\"';                              echo "→ Success"    >&2
+    ;;
   full|"")
     emit session_start
     sleep 1; echo "→ IDLE (no status yet); SID=$SID" >&2
@@ -232,7 +315,11 @@ case "$SCENARIO" in
     emit stop response:'\"full sequence done\"'
     echo "→ SUCCESS (green) then IDLE" >&2
     ;;
-  *) echo "usage: mise run warp:test:sidebar -- [full|start|running|blocked|question|stop|error|cancelled|reset]" >&2; exit 2 ;;
+  *)
+    echo "unknown scenario: $SCENARIO" >&2
+    echo "run: mise run warp:test:sidebar -- list" >&2
+    exit 2
+    ;;
 esac
 """
 
