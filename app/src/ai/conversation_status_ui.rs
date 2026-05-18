@@ -5,7 +5,7 @@ use warpui::color::ColorU;
 use warpui::elements::{ConstrainedBox, Container, CornerRadius, Radius};
 use warpui::Element;
 
-use crate::ai::agent::conversation::ConversationStatus;
+use crate::ai::agent::conversation::{ConversationStatus, StatusColorStyle};
 use crate::ai::agent_conversations_model::AgentRunDisplayStatus;
 use crate::ui_components::icons::Icon;
 
@@ -36,7 +36,10 @@ pub fn bazinga_status_icon_and_color(
     status: &ConversationStatus,
     theme: &WarpTheme,
 ) -> (Icon, ColorU) {
-    let (icon, _) = status.status_icon_and_color(theme);
+    let (icon, _) = status.status_icon_and_color(
+        theme,
+        crate::ai::agent::conversation::StatusColorStyle::Standard,
+    );
     let color = match status {
         ConversationStatus::InProgress => BAZINGA_IN_PROGRESS_COLOR,
         ConversationStatus::Blocked { .. } => BAZINGA_BLOCKED_COLOR,
@@ -69,7 +72,7 @@ pub trait StatusElementStyle {
 
 impl StatusElementStyle for ConversationStatus {
     fn status_icon_and_color(&self, theme: &WarpTheme) -> (Icon, ColorU) {
-        ConversationStatus::status_icon_and_color(self, theme)
+        ConversationStatus::status_icon_and_color(self, theme, StatusColorStyle::Standard)
     }
 }
 

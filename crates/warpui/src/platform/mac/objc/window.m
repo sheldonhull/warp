@@ -21,6 +21,8 @@ NSWindowStyleMask warpWindowMask = NSWindowStyleMaskClosable | NSWindowStyleMask
 
 // The default macOS titlebar height (in points).
 static const CGFloat DEFAULT_TITLEBAR_HEIGHT = 28.0;
+static const NSSize MIN_WINDOW_SIZE = {480.0, 192.0};
+static const NSSize TEST_MIN_WINDOW_SIZE = {124.0, 34.0};
 
 // A back-to-front ordered array of windows, identified by their `windowNumber`
 // property.
@@ -285,6 +287,7 @@ static NSLayoutConstraint *configure_titlebar_height(NSWindow *window, CGFloat h
 void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, bool hideTitleBar) {
     window.testMode = testMode;
     window.hideTitleBar = hideTitleBar;
+    NSSize minWindowSize = testMode ? TEST_MIN_WINDOW_SIZE : MIN_WINDOW_SIZE;
 
     // Set the background color to clear to support window background transparency. When this is set
     // to NSColor.clearColor with alpha = 0 and window drop shadows are enabled, MacOS renders a
@@ -298,6 +301,11 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
     window.acceptsMouseMovedEvents = YES;
     window.titlebarAppearsTransparent = hideTitleBar;
     window.titleVisibility = hideTitleBar ? NSWindowTitleHidden : NSWindowTitleVisible;
+    window.minSize = minWindowSize;
+    window.contentMinSize = minWindowSize;
+    if ([window respondsToSelector:@selector(setMinFullScreenContentSize:)]) {
+        window.minFullScreenContentSize = minWindowSize;
+    }
 }
 
 @implementation WarpWindow {
@@ -432,6 +440,15 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
     // We need to bypass the default performKeyEquivalent implementation which, in the case of
     // having keybinding conflicts with MacOS itself, yields priority to the OS.
     if ([event type] == NSEventTypeKeyDown) {
+        // Skip the key-equivalent priority path while the IME has marked text. Arrow keys carry
+        // NSEventModifierFlagFunction, so AppKit delivers them here before keyDown:. If we call
+        // keyDownImpl and Rust suppresses the keystroke (composing mode), we return NO, and AppKit
+        // proceeds to call keyDown: — running interpretKeyEvents a second time for the same event.
+        // See #9709.
+        if ([(WarpHostView *)self.contentView hasMarkedText]) {
+            return [super performKeyEquivalent:event];
+        }
+
         NSApplication *application = [NSApplication sharedApplication];
 
         // If we are recording a keystroke for an EditableBinding.

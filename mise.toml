@@ -4,6 +4,44 @@ gitleaks = "latest"
 protoc = "latest"
 trufflehog = "latest"
 
+# One-time bootstrap. Idempotent — safe to re-run any time. Run after a fresh
+# clone, after a macOS update that clears the system-managed Metal Toolchain,
+# or whenever `mise run r` complains a prerequisite is missing.
+#
+#   1. Verifies xcode-select points at a full Xcode.app (Command Line Tools
+#      alone don't ship the Metal shader compiler that crates/warpui needs).
+#   2. Downloads the Metal Toolchain via xcodebuild — it's a separate
+#      component from Xcode itself and gets cleared by some OS updates.
+#   3. Creates the `Warp Dev` self-signed code-signing cert in the login
+#      keychain (delegates to `cert:create`).
+#   4. mise itself installs cargo-bundle + protoc on `mise install` (declared
+#      under [tools] above).
+[tasks.setup]
+description = "One-time bootstrap (Xcode check + Metal Toolchain + dev cert)."
+depends = ["cert:create"]
+run = """
+set -euo pipefail
+[ "$(uname -s)" = "Darwin" ] || { echo "setup is macOS-only"; exit 0; }
+
+DEV_DIR="$(xcode-select -p 2>/dev/null || true)"
+if [ -z "$DEV_DIR" ] || [ "$DEV_DIR" = "/Library/Developer/CommandLineTools" ]; then
+  echo "✗ xcode-select is pointed at Command Line Tools or unset." >&2
+  echo "  Install Xcode.app from the App Store or developer.apple.com, then:" >&2
+  echo "    sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer" >&2
+  exit 1
+fi
+echo "✓ xcode-select: $DEV_DIR"
+
+if xcrun --find metal >/dev/null 2>&1 && xcrun metal --version >/dev/null 2>&1; then
+  echo "✓ Metal Toolchain present"
+else
+  echo "→ Downloading Metal Toolchain (~700 MB, idempotent)…"
+  xcodebuild -downloadComponent MetalToolchain
+fi
+
+echo "✓ setup complete. Run \\`mise run r\\` to build + launch WarpOss."
+"""
+
 # WarpBazinga dev rebuild loop. `mise run r` kills the running Warp build,
 # rebuilds + bundles via `./script/run --dont-open`, re-signs the bundle with a
 # stable dev cert so TCC grants survive rebuilds, then launches the freshly

@@ -160,16 +160,26 @@ impl BlocklistAIController {
             })
             .unwrap_or_else(|| {
                 history.update(ctx, |h, ctx| {
-                    h.start_new_conversation(terminal_view_id, false, true, ctx)
+                    h.start_new_conversation(terminal_view_id, false, true, false, ctx)
                 })
             });
-        self.shared_session_state.current_response_id = Some(stream_id.clone());
-        if self
-            .should_skip_replayed_response_for_existing_conversation(existing_conversation_id, ctx)
-        {
+        if self.should_skip_replayed_response_for_existing_conversation(
+            existing_conversation_id,
+            &init_event.request_id,
+            ctx,
+        ) {
+            self.shared_session_state.current_response_id = Some(stream_id);
             self.shared_session_state
                 .should_skip_current_replayed_response = true;
             return;
+        }
+
+        self.shared_session_state.current_response_id = Some(stream_id.clone());
+        if existing_conversation_id.is_some() {
+            history.update(ctx, |history, ctx| {
+                history.set_viewing_shared_session_for_conversation(conversation_id, true);
+                ctx.notify();
+            });
         }
 
         let Some(conversation) = history.as_ref(ctx).conversation(&conversation_id) else {
@@ -233,24 +243,46 @@ impl BlocklistAIController {
     fn should_skip_replayed_response_for_existing_conversation(
         &self,
         existing_conversation_id: Option<AIConversationId>,
+        init_request_id: &str,
         ctx: &mut ModelContext<Self>,
     ) -> bool {
         let Some(conversation_id) = existing_conversation_id else {
+            log::info!(
+                "should_skip_replayed_response: no existing conversation id, not skipping \
+                 (request_id={init_request_id})"
+            );
             return false;
         };
-        let model = self.terminal_model.lock();
-        if !model.is_receiving_agent_conversation_replay()
-            || !self
-                .shared_session_state
-                .should_suppress_replayed_response_for_existing_conversation
-        {
+        let is_receiving_replay = self
+            .terminal_model
+            .lock()
+            .is_receiving_agent_conversation_replay();
+        let suppress_enabled = self
+            .shared_session_state
+            .should_suppress_replayed_response_for_existing_conversation;
+        if !is_receiving_replay || !suppress_enabled {
+            log::info!(
+                "should_skip_replayed_response: not skipping \
+                 (request_id={init_request_id}, conversation_id={conversation_id:?}, \
+                 is_receiving_replay={is_receiving_replay}, suppress_enabled={suppress_enabled})"
+            );
             return false;
         }
-        drop(model);
 
-        BlocklistAIHistoryModel::as_ref(ctx)
-            .conversation(&conversation_id)
-            .is_some_and(|conversation| conversation.exchange_count() > 0)
+        // Only skip the replayed response when our local task already has the given request_id.
+        // New exchanges (e.g. the user's first post-handoff prompt) carry unseen request_ids and must flow through normally.
+        let history = BlocklistAIHistoryModel::as_ref(ctx);
+        let found = history.conversation(&conversation_id).is_some_and(|conv| {
+            conv.all_tasks()
+                .any(|task| task.messages().any(|msg| msg.request_id == init_request_id))
+        });
+        if !found {
+            log::info!(
+                "should_skip_replayed_response: not skipping, request_id not found in local \
+                 conversation (request_id={init_request_id}, conversation_id={conversation_id:?})"
+            );
+        }
+        found
     }
 
     fn on_shared_client_actions(

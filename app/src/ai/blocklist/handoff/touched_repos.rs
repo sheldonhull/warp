@@ -17,9 +17,6 @@
 //! (one `git remote get-url origin` per unique repo). Callers run them in sequence
 //! off the main thread; see `app/src/workspace/view.rs::start_local_to_cloud_handoff`.
 
-// TODO(REMOTE-1486): drop once the handoff UI in the parent stack branch wires this up.
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -190,6 +187,17 @@ fn parse_github_repo(remote_url: &str) -> Option<GithubRepo> {
         return None;
     }
     Some(GithubRepo::new(owner, repo))
+}
+
+/// Resolve a single directory path to its enclosing git repo and parsed GitHub
+/// remote, if any.
+pub(crate) async fn resolve_repo_for_path(path: &Path) -> Option<TouchedRepo> {
+    let git_root = find_git_root(path).await?;
+    let repo_id = git_origin_url(&git_root)
+        .await
+        .as_deref()
+        .and_then(parse_github_repo);
+    Some(TouchedRepo { git_root, repo_id })
 }
 
 /// Pick the env that has the most overlap with the touched repos, breaking ties by

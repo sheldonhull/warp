@@ -135,7 +135,11 @@ use crate::ai::aws_credentials::AwsCredentialRefresher as _;
 use crate::ai::mcp::FileBasedMCPManager;
 use crate::ai::mcp::FileMCPWatcher;
 use crate::uri::web_intent_parser::maybe_rewrite_web_url_to_intent;
-use ::ai::index::full_source_code_embedding::manager::CodebaseIndexManager;
+use ::ai::index::full_source_code_embedding::manager::{
+    CodebaseIndexManager, CodebaseIndexManagerConfig,
+};
+#[cfg(feature = "local_fs")]
+use ::ai::index::full_source_code_embedding::SnapshotStorage;
 use ::ai::index::full_source_code_embedding::SyncTask;
 use ::ai::index::DEFAULT_SYNC_REQUESTS_PER_MIN;
 use ::ai::project_context::model::ProjectContextModel;
@@ -193,9 +197,11 @@ use warpui::platform::app::ApproveTerminateResult;
 use window_settings::WindowSettings;
 use workflows::manager::WorkflowManager;
 
+use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::ambient_agents::github_auth_notifier::GitHubAuthNotifier;
 use crate::ai::document::ai_document_model::AIDocumentModel;
 use crate::ai::facts::manager::AIFactManager;
+use crate::ai::harness_availability::HarnessAvailabilityModel;
 use crate::ai::llms::LLMPreferences;
 use crate::ai::mcp::MCPGalleryManager;
 use crate::ai::mcp::TemplatableMCPServerManager;
@@ -220,6 +226,7 @@ use crate::notebooks::editor::keys::NotebookKeybindings;
 use crate::notebooks::manager::NotebookManager;
 use crate::notebooks::CloudNotebook;
 use crate::palette::PaletteMode;
+use crate::persistence::model::AgentConversationData;
 use crate::persistence::PersistenceWriter;
 use crate::projects::ProjectManagementModel;
 use crate::server::cloud_objects::{listener::Listener, update_manager::UpdateManager};
@@ -258,9 +265,13 @@ use referral_theme_status::ReferralThemeStatus;
 use rust_embed::RustEmbed;
 use server::server_api::ServerApiProvider;
 use settings::{ExtraMetaKeys, PrivacySettings};
+#[cfg(feature = "local_fs")]
+use shellexpand::tilde;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ops::Deref;
+#[cfg(feature = "local_fs")]
+use std::path::PathBuf;
 use std::sync::Arc;
 use terminal::input;
 use terminal::session_settings::SessionSettings;
@@ -338,7 +349,24 @@ fn determine_agent_source(
         }
         // RemoteServerProxy and RemoteServerDaemon are headless server
         // processes that don't use the agent subsystem.
-        LaunchMode::RemoteServerProxy | LaunchMode::RemoteServerDaemon => None,
+        LaunchMode::RemoteServerProxy | LaunchMode::RemoteServerDaemon { .. } => None,
+    }
+}
+
+#[cfg(feature = "local_fs")]
+fn daemon_codebase_index_snapshot_storage(launch_mode: &LaunchMode) -> Option<SnapshotStorage> {
+    match launch_mode {
+        LaunchMode::RemoteServerDaemon { identity_key } => {
+            let data_dir = remote_server::setup::remote_server_daemon_data_dir(identity_key);
+            let snapshot_dir = PathBuf::from(tilde(&data_dir).into_owned())
+                .join("cache")
+                .join("codebase_index_snapshots");
+            SnapshotStorage::from_dir(snapshot_dir)
+        }
+        LaunchMode::App { .. }
+        | LaunchMode::CommandLine { .. }
+        | LaunchMode::RemoteServerProxy
+        | LaunchMode::Test { .. } => None,
     }
 }
 
@@ -375,7 +403,11 @@ pub enum LaunchMode {
 
     /// Remote server daemon — long-lived headless process serving remote
     /// connections via a Unix domain socket.
-    RemoteServerDaemon,
+    RemoteServerDaemon {
+        /// Stable identity key used to partition the daemon's socket/PID
+        /// directory on the remote host.
+        identity_key: String,
+    },
 }
 
 impl LaunchMode {
@@ -385,7 +417,7 @@ impl LaunchMode {
             LaunchMode::CommandLine { .. }
             | LaunchMode::Test { .. }
             | LaunchMode::RemoteServerProxy
-            | LaunchMode::RemoteServerDaemon => Cow::Owned(warp_cli::AppArgs::default()),
+            | LaunchMode::RemoteServerDaemon { .. } => Cow::Owned(warp_cli::AppArgs::default()),
         }
     }
 
@@ -399,7 +431,7 @@ impl LaunchMode {
             LaunchMode::App { .. }
             | LaunchMode::CommandLine { .. }
             | LaunchMode::RemoteServerProxy
-            | LaunchMode::RemoteServerDaemon => false,
+            | LaunchMode::RemoteServerDaemon { .. } => false,
         }
     }
 
@@ -409,7 +441,7 @@ impl LaunchMode {
             LaunchMode::App { .. }
             | LaunchMode::CommandLine { .. }
             | LaunchMode::RemoteServerProxy
-            | LaunchMode::RemoteServerDaemon => None,
+            | LaunchMode::RemoteServerDaemon { .. } => None,
         }
     }
 
@@ -426,9 +458,10 @@ impl LaunchMode {
             LaunchMode::App { .. } => ExecutionMode::App,
             LaunchMode::CommandLine { .. } => ExecutionMode::Sdk,
             LaunchMode::Test { .. } => ExecutionMode::App,
-            // RemoteServerProxy and RemoteServerDaemon don't use execution
-            // mode, but Sdk is the closest match (headless, no GUI).
-            LaunchMode::RemoteServerProxy | LaunchMode::RemoteServerDaemon => ExecutionMode::Sdk,
+            // RemoteServerProxy is a thin byte bridge; Sdk is the closest match.
+            LaunchMode::RemoteServerProxy => ExecutionMode::Sdk,
+            // RemoteServerDaemon gets its own mode for distinct Sentry tagging.
+            LaunchMode::RemoteServerDaemon { .. } => ExecutionMode::RemoteServerDaemon,
         }
     }
 
@@ -438,7 +471,7 @@ impl LaunchMode {
             LaunchMode::App { .. }
             | LaunchMode::Test { .. }
             | LaunchMode::RemoteServerProxy
-            | LaunchMode::RemoteServerDaemon => false,
+            | LaunchMode::RemoteServerDaemon { .. } => false,
         }
     }
 
@@ -449,19 +482,22 @@ impl LaunchMode {
                 CliCommand::Agent(AgentCommand::Run(args)) => !args.gui,
                 _ => true,
             },
-            LaunchMode::RemoteServerProxy | LaunchMode::RemoteServerDaemon => true,
+            LaunchMode::RemoteServerProxy | LaunchMode::RemoteServerDaemon { .. } => true,
             LaunchMode::App { .. } | LaunchMode::Test { .. } => false,
         }
     }
 
-    /// Returns `true` if running in app mode or via `agent run` to permit codebase indexing.
+    /// Returns `true` if this process can build and sync codebase indices.
     fn supports_indexing(&self) -> bool {
         match self {
             LaunchMode::CommandLine { command, .. } => {
                 matches!(command, CliCommand::Agent(AgentCommand::Run { .. }))
             }
+            LaunchMode::RemoteServerDaemon { .. } => {
+                FeatureFlag::RemoteCodebaseIndexing.is_enabled()
+            }
             LaunchMode::App { .. } | LaunchMode::Test { .. } => true,
-            LaunchMode::RemoteServerProxy | LaunchMode::RemoteServerDaemon => false,
+            LaunchMode::RemoteServerProxy => false,
         }
     }
 
@@ -473,29 +509,29 @@ impl LaunchMode {
             LaunchMode::CommandLine { .. }
             | LaunchMode::Test { .. }
             | LaunchMode::RemoteServerProxy
-            | LaunchMode::RemoteServerDaemon => false,
+            | LaunchMode::RemoteServerDaemon { .. } => false,
         }
     }
 
-    /// Whether Sentry / crash reporting should be initialized in `init_common`.
+    /// Whether Sentry / crash reporting should be initialized.
     #[cfg_attr(not(feature = "crash_reporting"), allow(dead_code))]
-    fn needs_crash_reporting(&self) -> bool {
+    pub(crate) fn needs_crash_reporting(&self) -> bool {
         match self {
             LaunchMode::App { .. }
             | LaunchMode::CommandLine { .. }
             | LaunchMode::Test { .. }
-            | LaunchMode::RemoteServerDaemon
+            | LaunchMode::RemoteServerDaemon { .. }
             | LaunchMode::RemoteServerProxy => true,
         }
     }
 
-    /// Whether profiling and tracing should be initialized in `init_common`.
-    fn needs_profiling(&self) -> bool {
+    /// Whether profiling and tracing should be initialized.
+    pub(crate) fn needs_profiling(&self) -> bool {
         match self {
             LaunchMode::App { .. }
             | LaunchMode::CommandLine { .. }
             | LaunchMode::Test { .. }
-            | LaunchMode::RemoteServerDaemon
+            | LaunchMode::RemoteServerDaemon { .. }
             | LaunchMode::RemoteServerProxy => true,
         }
     }
@@ -512,7 +548,7 @@ impl LaunchMode {
             }
             // Proxy must log to stderr because stdout is the protocol channel.
             LaunchMode::RemoteServerProxy => Some(LogDestination::Stderr),
-            LaunchMode::RemoteServerDaemon => Some(LogDestination::File),
+            LaunchMode::RemoteServerDaemon { .. } => Some(LogDestination::File),
             LaunchMode::App { .. } | LaunchMode::Test { .. } => None,
         }
     }
@@ -636,12 +672,20 @@ pub fn run() -> Result<()> {
             }
             #[cfg(not(target_family = "wasm"))]
             warp_cli::Command::Worker(warp_cli::WorkerCommand::RemoteServerProxy(args)) => {
-                init_common(&LaunchMode::RemoteServerProxy, None)?;
+                // Proxy is a thin byte bridge (stdin/stdout ↔ Unix socket).
+                // It only needs logging to stderr since stdout is the protocol
+                // channel. No crash reporting, no initialize_app.
+                let launch_mode = LaunchMode::RemoteServerProxy;
+                warp_logging::init(warp_logging::LogConfig {
+                    is_cli: true,
+                    log_destination: launch_mode.log_destination(),
+                })?;
                 return crate::remote_server::run_proxy(args.identity_key.clone());
             }
             #[cfg(not(target_family = "wasm"))]
             warp_cli::Command::Worker(warp_cli::WorkerCommand::RemoteServerDaemon(args)) => {
-                init_common(&LaunchMode::RemoteServerDaemon, None)?;
+                // Daemon handles its own full initialization (including
+                // initialize_app and crash reporting) inside run_daemon_app.
                 return crate::remote_server::run_daemon(args.identity_key.clone());
             }
             #[cfg(not(target_family = "wasm"))]
@@ -735,12 +779,14 @@ pub fn run_integration_test(driver: TestDriver) -> Result<()> {
     run_internal(launch)
 }
 
-/// Shared early initialization for **every** process type (app, CLI, proxy,
-/// daemon).  Every step in this function runs for all modes, including
-/// lightweight ones like Proxy.  Think carefully before adding here — if
-/// the step is only needed by the full app, add it to `run_internal`
-/// instead.
-fn init_common(launch_mode: &LaunchMode, timer: Option<&mut IntervalTimer>) -> Result<()> {
+/// Runs the app (or CLI / daemon).
+fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
+    let mut timer = IntervalTimer::new();
+
+    // ── Early initialization (pre-AppBuilder) ──────────────────────
+    // These steps run before the platform event loop is started.
+    // They must not depend on AppContext.
+
     #[cfg(windows)]
     dynamic_libraries::configure_library_loading();
 
@@ -780,9 +826,7 @@ fn init_common(launch_mode: &LaunchMode, timer: Option<&mut IntervalTimer>) -> R
         }
     }
 
-    if let Some(timer) = timer {
-        timer.mark_interval_end("LOG_FILE_SETUP_COMPLETE");
-    }
+    timer.mark_interval_end("LOG_FILE_SETUP_COMPLETE");
 
     #[cfg(windows)]
     platform::windows::check_redirection_guard();
@@ -799,19 +843,6 @@ fn init_common(launch_mode: &LaunchMode, timer: Option<&mut IntervalTimer>) -> R
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("must be able to initialize crypto provider for TLS support");
-
-    Ok(())
-}
-
-/// Runs the app.
-///
-/// Note that every initialization step in this function is specific to the GUI app and Oz. If you want
-/// to add setup steps that should be generic to all launch modes (e.g. remote server). It should be added
-/// in init_common instead.
-fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
-    let mut timer = IntervalTimer::new();
-
-    init_common(&launch_mode, Some(&mut timer))?;
 
     // For wasm builds we have this special case to parse out the intent
     // from the url that is used to visite the app on web.
@@ -1069,7 +1100,7 @@ pub struct UpdateQuakeModeEventArg {
     active_window_id: Option<WindowId>,
 }
 
-fn initialize_app(
+pub(crate) fn initialize_app(
     launch_mode: &LaunchMode,
     mut timer: IntervalTimer,
     startup_toml_parse_error: Option<warpui_extras::user_preferences::Error>,
@@ -1159,7 +1190,18 @@ fn initialize_app(
 
     // If any part of sqlite initialization fails, we just don't do session restoration (i.e.
     // feature degradation).
-    let (sqlite_data, writer_handles) = persistence::initialize(ctx);
+    let persistence_scope = match launch_mode {
+        LaunchMode::RemoteServerDaemon { identity_key } => {
+            persistence::PersistenceScope::RemoteServerDaemon {
+                identity_key: identity_key.clone(),
+            }
+        }
+        LaunchMode::App { .. }
+        | LaunchMode::CommandLine { .. }
+        | LaunchMode::RemoteServerProxy
+        | LaunchMode::Test { .. } => persistence::PersistenceScope::App,
+    };
+    let (sqlite_data, writer_handles) = persistence::initialize(ctx, persistence_scope);
     timer.mark_interval_end("SQLITE_INITIALIZED");
 
     let persistence_writer = PersistenceWriter::new(writer_handles);
@@ -1194,24 +1236,24 @@ fn initialize_app(
     });
 
     let (
-        cloud_objects,
-        cached_workspaces,
-        current_workspace_uid,
-        app_state,
-        command_history,
-        restored_user_profiles,
-        time_of_next_force_object_refresh,
-        object_actions,
-        experiments,
-        ai_queries,
+        mut cloud_objects,
+        mut cached_workspaces,
+        mut current_workspace_uid,
+        mut app_state,
+        mut command_history,
+        mut restored_user_profiles,
+        mut time_of_next_force_object_refresh,
+        mut object_actions,
+        mut experiments,
+        mut ai_queries,
         persisted_workspaces,
-        workspace_language_servers,
-        multi_agent_conversations,
-        persisted_projects,
-        persisted_project_rules,
-        persisted_ignored_suggestions,
-        persisted_mcp_server_installations,
-        mcp_servers_to_restore,
+        mut workspace_language_servers,
+        mut multi_agent_conversations,
+        mut persisted_projects,
+        mut persisted_project_rules,
+        mut persisted_ignored_suggestions,
+        mut persisted_mcp_server_installations,
+        mut mcp_servers_to_restore,
     ) = sqlite_data
         .map(|sqlite_data| {
             (
@@ -1257,6 +1299,30 @@ fn initialize_app(
                 Default::default(),
             )
         });
+
+    if matches!(launch_mode, LaunchMode::RemoteServerDaemon { .. }) {
+        let codebase_index_count = persisted_workspaces.len();
+        log::info!(
+            "[Remote codebase indexing] Restored daemon codebase index metadata: metadata_count={codebase_index_count}"
+        );
+        cloud_objects = Default::default();
+        cached_workspaces = Default::default();
+        current_workspace_uid = None;
+        app_state = None;
+        command_history = Default::default();
+        restored_user_profiles = Default::default();
+        time_of_next_force_object_refresh = None;
+        object_actions = Default::default();
+        experiments = Default::default();
+        ai_queries = Default::default();
+        workspace_language_servers = Default::default();
+        multi_agent_conversations = Default::default();
+        persisted_projects = Default::default();
+        persisted_project_rules = Default::default();
+        persisted_ignored_suggestions = Default::default();
+        persisted_mcp_server_installations = Default::default();
+        mcp_servers_to_restore = Default::default();
+    }
 
     // Initialize a global model to track server-side experiment state.
     // This depends on the [`GlobalResourceHandlesProvider`] and so it must
@@ -1359,6 +1425,8 @@ fn initialize_app(
     ctx.add_singleton_model(|_ctx| SyncedInputState::new());
 
     ctx.add_singleton_model(remote_server::manager::RemoteServerManager::new);
+    #[cfg(not(target_family = "wasm"))]
+    ctx.add_singleton_model(remote_server::codebase_index_model::RemoteCodebaseIndexModel::new);
     #[cfg(not(target_family = "wasm"))]
     remote_server::wire_auth_token_rotation(ctx);
 
@@ -1471,16 +1539,19 @@ fn initialize_app(
     {
         let imported_config_model = ctx.add_singleton_model(ImportedConfigModel::new);
 
-        if FeatureFlag::SettingsImport.is_enabled()
-            && ChannelState::channel() != warp_core::channel::Channel::Integration
-        {
+        if ChannelState::channel() != warp_core::channel::Channel::Integration {
             imported_config_model.update(ctx, |model, ctx| {
                 model.search_for_settings_to_import(ctx);
             });
         }
 
+        let emit_incremental_updates = matches!(launch_mode, LaunchMode::RemoteServerDaemon { .. });
         ctx.add_singleton_model(|ctx| {
-            let model = RepoMetadataModel::new(ctx);
+            let model = if emit_incremental_updates {
+                RepoMetadataModel::new_with_incremental_updates(ctx)
+            } else {
+                RepoMetadataModel::new(ctx)
+            };
 
             // Subscribe to RemoteServerManager push events so that remote repo
             // metadata snapshots and incremental updates populate the remote
@@ -1662,10 +1733,34 @@ fn initialize_app(
         )
     });
 
+    // Seed the orchestration pin set from persisted conversation data
+    // before the conversations vec is consumed by the singletons below.
+    // Each conversation's `AgentConversationData.pinned` is the source of
+    // truth; the singleton mirrors them in memory for fast cross-pane lookups.
+    let initial_pinned_conversations: HashSet<AIConversationId> = multi_agent_conversations
+        .iter()
+        .filter_map(|conv| {
+            let data =
+                serde_json::from_str::<AgentConversationData>(&conv.conversation.conversation_data)
+                    .ok()?;
+            if !data.pinned {
+                return None;
+            }
+            AIConversationId::try_from(conv.conversation.conversation_id.clone()).ok()
+        })
+        .collect();
     {
         let conversations = &multi_agent_conversations;
         ctx.add_singleton_model(move |_| BlocklistAIHistoryModel::new(ai_queries, conversations));
     }
+    // Cross-pane UI state for the orchestration pill bar. Registered
+    // after the history model since it subscribes to history events.
+    ctx.add_singleton_model(move |ctx| {
+        ai::blocklist::agent_view::orchestration_pill_bar_model::OrchestrationPillBarModel::new(
+            initial_pinned_conversations,
+            ctx,
+        )
+    });
     ctx.add_singleton_model(move |_| RestoredAgentConversations::new(multi_agent_conversations));
     ctx.add_singleton_model(|_| CLIAgentSessionsModel::new());
     // ActiveAgentViewsModel is used to track active agent conversations and notify listeners when they change.
@@ -1680,7 +1775,11 @@ fn initialize_app(
         );
     }
 
-    ctx.add_singleton_model(RepoOutlines::new);
+    if launch_mode.supports_indexing() {
+        ctx.add_singleton_model(RepoOutlines::new);
+    } else {
+        ctx.add_singleton_model(|ctx| RepoOutlines::new_with_indexing_enabled(false, ctx));
+    }
     ctx.add_singleton_model(|ctx| {
         warp_core::sync_queue::SyncQueue::<SyncTask>::new_with_rate_limit(
             &ctx.background_executor(),
@@ -1811,6 +1910,7 @@ fn initialize_app(
     ctx.add_singleton_model(LocalWorkflows::new);
 
     ctx.add_singleton_model(LLMPreferences::new);
+    ctx.add_singleton_model(HarnessAvailabilityModel::new);
 
     ctx.add_singleton_model(|ctx| {
         ai::agent_tips::AITipModel::<ai::AgentTip>::new_for_agent_tips(ctx)
@@ -1836,29 +1936,44 @@ fn initialize_app(
     ctx.add_singleton_model(DefaultTerminal::new);
 
     ctx.add_singleton_model(|ctx| {
-        let indices_to_restore = if UserWorkspaces::as_ref(ctx).is_codebase_context_enabled(ctx)
-            && launch_mode.supports_indexing()
-        {
+        let should_restore_indices = launch_mode.supports_indexing()
+            && (matches!(launch_mode, LaunchMode::RemoteServerDaemon { .. })
+                || UserWorkspaces::as_ref(ctx).is_codebase_context_enabled(ctx));
+        let indices_to_restore = if should_restore_indices {
             persisted_workspaces.clone()
         } else {
             vec![]
         };
 
         let codebase_limits = AIRequestUsageModel::as_ref(ctx).codebase_context_limits();
-
-        CodebaseIndexManager::new(
+        let codebase_index_config = CodebaseIndexManagerConfig::new(
             indices_to_restore,
             codebase_limits.max_indices_allowed,
             codebase_limits.max_files_per_repo,
             codebase_limits.embedding_generation_batch_size,
             server_api_provider.as_ref(ctx).get(),
-            ctx,
-        )
+            launch_mode.supports_indexing(),
+        );
+        #[cfg(feature = "local_fs")]
+        if let Some(snapshot_storage) = daemon_codebase_index_snapshot_storage(launch_mode) {
+            return CodebaseIndexManager::new_with_snapshot_storage(
+                codebase_index_config,
+                Some(snapshot_storage),
+                ctx,
+            );
+        }
+
+        CodebaseIndexManager::new_with_config(codebase_index_config, ctx)
     });
 
     ctx.add_singleton_model(|ctx| {
         ProjectContextModel::new_from_persisted(persisted_project_rules, ctx)
     });
+
+    // Index global rules (e.g. ~/.agents/AGENTS.md) on a background task so
+    // they are available to subsequent agent queries.
+    ProjectContextModel::handle(ctx).update(ctx, |me, ctx| me.index_global_rules(ctx));
+
     ctx.add_singleton_model(|ctx| {
         PersistedWorkspace::new(
             persisted_workspaces,
@@ -1892,7 +2007,7 @@ fn initialize_app(
     app_state
 }
 
-fn app_callbacks(is_integration_test: bool) -> warpui::platform::AppCallbacks {
+pub(crate) fn app_callbacks(is_integration_test: bool) -> warpui::platform::AppCallbacks {
     warpui::platform::AppCallbacks {
         on_internet_reachability_changed: Some(Box::new(move |reachable, ctx| {
             NetworkStatus::handle(ctx)
@@ -2341,7 +2456,7 @@ fn launch(ctx: &mut warpui::AppContext, app_state: Option<AppState>, launch_mode
     #[cfg(target_family = "wasm")]
     ctx.set_fallback_font_fn(font_fallback::fallback_font_fn);
 
-    match &launch_mode {
+    match launch_mode {
         LaunchMode::App { .. } | LaunchMode::Test { .. } => {
             // Attempt to restore windows from the persisted application state.
             let arg = OpenFromRestoredArg { app_state };
@@ -2395,11 +2510,21 @@ fn launch(ctx: &mut warpui::AppContext, app_state: Option<AppState>, launch_mode
                 }
             }
         }
-        // RemoteServerProxy and RemoteServerDaemon never go through
-        // run_internal / launch; they call init_common directly and then
-        // their own entry points.
-        LaunchMode::RemoteServerProxy | LaunchMode::RemoteServerDaemon => {
-            log::error!("Proxy/Daemon modes should not use the launch() path");
+        // Proxy should never reach launch() — it's a thin byte bridge.
+        LaunchMode::RemoteServerProxy => {
+            log::error!("Proxy mode should not use the launch() path");
+            std::process::exit(1);
+        }
+        // Daemon: bind the Unix socket and register the ServerModel.
+        // initialize_app already set up everything else including crash
+        // reporting.
+        #[cfg(unix)]
+        LaunchMode::RemoteServerDaemon { identity_key } => {
+            remote_server::unix::launch_daemon(&identity_key, ctx);
+        }
+        #[cfg(not(unix))]
+        LaunchMode::RemoteServerDaemon { .. } => {
+            log::error!("RemoteServerDaemon is not supported on this platform");
             std::process::exit(1);
         }
     }
@@ -2482,8 +2607,6 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::DefaultWaterfallMode,
         #[cfg(feature = "settings_file")]
         FeatureFlag::SettingsFile,
-        #[cfg(feature = "settings_import")]
-        FeatureFlag::SettingsImport,
         #[cfg(feature = "rect_selection")]
         FeatureFlag::RectSelection,
         #[cfg(feature = "alacritty_settings_import")]
@@ -2498,12 +2621,8 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::AIRules,
         #[cfg(feature = "ssh_tmux_wrapper")]
         FeatureFlag::SSHTmuxWrapper,
-        #[cfg(feature = "less_horizontal_terminal_padding")]
-        FeatureFlag::LessHorizontalTerminalPadding,
         #[cfg(feature = "shell_selector")]
         FeatureFlag::ShellSelector,
-        #[cfg(feature = "block_toolbelt_save_as_workflow")]
-        FeatureFlag::BlockToolbeltSaveAsWorkflow,
         #[cfg(feature = "integration_command")]
         FeatureFlag::IntegrationCommand,
         #[cfg(feature = "artifact_command")]
@@ -2518,8 +2637,6 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::FullScreenZenMode,
         #[cfg(feature = "minimalist_ui")]
         FeatureFlag::MinimalistUI,
-        #[cfg(feature = "remove_alt_screen_padding")]
-        FeatureFlag::RemoveAltScreenPadding,
         #[cfg(feature = "avatar_in_tab_bar")]
         FeatureFlag::AvatarInTabBar,
         #[cfg(feature = "workflow_aliases")]
@@ -2574,6 +2691,8 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::PredictAMQueries,
         #[cfg(feature = "full_source_code_embedding")]
         FeatureFlag::FullSourceCodeEmbedding,
+        #[cfg(feature = "remote_codebase_indexing")]
+        FeatureFlag::RemoteCodebaseIndexing,
         #[cfg(feature = "use_tantivy_search")]
         FeatureFlag::UseTantivySearch,
         #[cfg(feature = "grep_tool")]
@@ -2626,8 +2745,6 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::CodebaseIndexSpeedbump,
         #[cfg(feature = "context_line_review_comments")]
         FeatureFlag::ContextLineReviewComments,
-        #[cfg(feature = "nld_fasttext_model")]
-        FeatureFlag::NLDClassifierModelEnabled,
         #[cfg(feature = "fast_forward_autoexecute_button")]
         FeatureFlag::FastForwardAutoexecuteButton,
         #[cfg(feature = "code_find_replace")]
@@ -2690,8 +2807,6 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::VimCodeEditor,
         #[cfg(feature = "allow_opening_file_links_using_editor_env")]
         FeatureFlag::AllowOpeningFileLinksUsingEditorEnv,
-        #[cfg(feature = "nld_improvements")]
-        FeatureFlag::NldImprovements,
         #[cfg(feature = "revert_diff_hunk")]
         FeatureFlag::RevertDiffHunk,
         #[cfg(feature = "code_review_save_changes")]
@@ -2706,6 +2821,8 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::AmbientAgentsImageUpload,
         #[cfg(feature = "scheduled_ambient_agents")]
         FeatureFlag::ScheduledAmbientAgents,
+        #[cfg(feature = "conversation_api")]
+        FeatureFlag::ConversationApi,
         #[cfg(feature = "code_launch_modal")]
         FeatureFlag::CodeLaunchModal,
         #[cfg(feature = "api_key_authentication")]
@@ -2774,8 +2891,12 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::AgentModeComputerUse,
         #[cfg(feature = "local_computer_use")]
         FeatureFlag::LocalComputerUse,
+        #[cfg(feature = "local_claude_codex_child_harnesses")]
+        FeatureFlag::LocalClaudeCodexChildHarnesses,
         #[cfg(feature = "team_api_keys")]
         FeatureFlag::TeamApiKeys,
+        #[cfg(feature = "named_agents")]
+        FeatureFlag::NamedAgents,
         #[cfg(feature = "cloud_conversations")]
         FeatureFlag::CloudConversations,
         #[cfg(feature = "agent_toolbar_editor")]
@@ -2806,6 +2927,8 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::SummarizationViaMessageReplacement,
         #[cfg(feature = "pluggable_notifications")]
         FeatureFlag::PluggableNotifications,
+        #[cfg(feature = "async_find")]
+        FeatureFlag::AsyncFind,
         #[cfg(feature = "list_skills")]
         FeatureFlag::ListSkills,
         #[cfg(feature = "ask_user_question")]
@@ -2826,6 +2949,8 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::OzLaunchModal,
         #[cfg(feature = "open_warp_launch_modal")]
         FeatureFlag::OpenWarpLaunchModal,
+        #[cfg(feature = "orchestration_launch_modal")]
+        FeatureFlag::OrchestrationLaunchModal,
         #[cfg(feature = "new_tab_styling")]
         FeatureFlag::NewTabStyling,
         #[cfg(feature = "skill_arguments")]
@@ -2836,12 +2961,14 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::ConversationsAsContext,
         #[cfg(feature = "incremental_auto_reload")]
         FeatureFlag::IncrementalAutoReload,
-        #[cfg(feature = "orchestration")]
-        FeatureFlag::Orchestration,
         #[cfg(feature = "orchestration_v2")]
         FeatureFlag::OrchestrationV2,
         #[cfg(feature = "orchestration_pill_bar")]
         FeatureFlag::OrchestrationPillBar,
+        #[cfg(feature = "orchestration_viewer_pill_bar")]
+        FeatureFlag::OrchestrationViewerPillBar,
+        #[cfg(feature = "run_agents_tool")]
+        FeatureFlag::RunAgentsTool,
         #[cfg(feature = "pending_user_query_indicator")]
         FeatureFlag::PendingUserQueryIndicator,
         #[cfg(feature = "queue_slash_command")]
@@ -2866,6 +2993,8 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::AgentHarness,
         #[cfg(feature = "oz_handoff")]
         FeatureFlag::OzHandoff,
+        #[cfg(feature = "handoff_local_cloud")]
+        FeatureFlag::HandoffLocalCloud,
         #[cfg(feature = "hoa_notifications")]
         FeatureFlag::HOANotifications,
         #[cfg(feature = "open_code_notifications")]
@@ -2898,6 +3027,10 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::ConfigurableContextWindow,
         #[cfg(feature = "handoff_cloud_cloud")]
         FeatureFlag::HandoffCloudCloud,
+        #[cfg(feature = "git_credential_refresh")]
+        FeatureFlag::GitCredentialRefresh,
+        #[cfg(feature = "remote_code_review")]
+        FeatureFlag::RemoteCodeReview,
     ]);
 
     flags

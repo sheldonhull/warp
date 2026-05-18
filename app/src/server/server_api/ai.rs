@@ -16,9 +16,8 @@ use warp_core::{features::FeatureFlag, report_error};
 use warp_multi_agent_api::ConversationData;
 
 use super::auth::AuthClient;
-use super::harness_support::UploadTarget;
+use super::harness_support::{UploadField, UploadFieldValue, UploadTarget};
 use super::ServerApi;
-use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent::conversation::{
     AIAgentConversationFormat, AIAgentHarness, AIAgentSerializedBlockFormat,
     ServerAIConversationMetadata,
@@ -32,6 +31,7 @@ use crate::ai::generate_code_review_content::api::{
 use crate::ai::request_usage_model::RequestLimitInfo;
 #[cfg(not(feature = "agent_mode_evals"))]
 use crate::ai::BonusGrant;
+use crate::ai::{agent::api::ServerConversationToken, harness_availability::HarnessAvailability};
 use crate::persistence::model::ConversationUsageMetadata;
 use crate::terminal::model::block::SerializedBlock;
 #[cfg(not(feature = "agent_mode_evals"))]
@@ -121,6 +121,10 @@ use warp_graphql::{
             UpdateMerkleTreeVariables,
         },
     },
+    queries::task_git_credentials::{
+        TaskGitCredentials, TaskGitCredentialsInput, TaskGitCredentialsResult,
+        TaskGitCredentialsVariables,
+    },
     queries::{
         codebase_context_config::{
             CodebaseContextConfigQuery, CodebaseContextConfigResult, CodebaseContextConfigVariables,
@@ -129,6 +133,7 @@ use warp_graphql::{
             FreeAvailableModels, FreeAvailableModelsInput, FreeAvailableModelsResult,
             FreeAvailableModelsVariables,
         },
+        get_available_harnesses::{GetAvailableHarnesses, GetAvailableHarnessesVariables},
         get_feature_model_choices::{GetFeatureModelChoices, GetFeatureModelChoicesVariables},
         get_relevant_fragments::{
             GetRelevantFragmentsQuery, GetRelevantFragmentsResult, GetRelevantFragmentsVariables,
@@ -208,6 +213,9 @@ pub struct SpawnAgentRequest {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub team: Option<bool>,
+    /// Agent identity UID to use as the execution principal for the run.
+    #[serde(rename = "agent_identity_uid", skip_serializing_if = "Option::is_none")]
+    pub agent_identity_uid: Option<String>,
     /// Use a Claude-compatible skill as the base prompt.
     /// Format: "repo:skill_name" or just "skill_name".
     /// The skill is resolved at runtime in the agent environment.
@@ -227,15 +235,20 @@ pub struct SpawnAgentRequest {
     /// Base64-encoded `warp.multi_agent.v1.Attachment` payloads to restore as referenced attachments.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub referenced_attachments: Vec<String>,
-    /// When set, instructs the server to fork the named conversation and use the resulting
-    /// fork id as `task.AgentConversationID`. Used by the local-to-cloud handoff flow.
+    /// Server-side conversation id to resume against (sets `task.AgentConversationID`).
+    /// For local-to-cloud handoff this is the forked conversation id returned by
+    /// `POST /agent/conversations/{conversation_id}/fork` at chip-click time.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub fork_from_conversation_id: Option<String>,
+    pub conversation_id: Option<String>,
     /// References a batch of files previously uploaded to handoff/{token}/
     /// via `POST /agent/handoff/upload-snapshot`. The server stores the token on the new run's
     /// queued execution input and resolves the prefix in place at rehydration time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initial_snapshot_token: Option<InitialSnapshotToken>,
+    /// When `Some(true)`, the cloud agent skips the end-of-run snapshot upload.
+    /// Set by the client when cloud conversation storage is disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_disabled: Option<bool>,
 }
 
 /// Server-minted token returned by `POST /agent/handoff/upload-snapshot` that scopes a batch
@@ -252,8 +265,8 @@ impl InitialSnapshotToken {
 }
 
 /// Request body for `POST /agent/handoff/upload-snapshot`. Used by the local-to-cloud
-/// handoff flow (REMOTE-1486) to allocate a token and presigned upload URLs
-/// scoped to `handoff/{token}/` before any task exists.
+/// handoff flow to allocate a token and presigned upload URLs scoped to
+/// `handoff/{token}/` before any task exists.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UploadLocalHandoffSnapshotRequest {
     pub files: Vec<SnapshotUploadFileInfo>,
@@ -276,6 +289,20 @@ pub struct UploadLocalHandoffSnapshotResponse {
     pub initial_snapshot_token: InitialSnapshotToken,
     pub expires_at: String,
     pub uploads: Vec<UploadTarget>,
+}
+
+/// Request body for `POST /agent/conversations/{conversation_id}/fork`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ForkConversationRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+}
+
+/// Response body for `POST /agent/conversations/{conversation_id}/fork`. The returned id is sent
+/// on the subsequent `POST /agent/runs` request under `conversation_id` (resume semantics).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ForkConversationResponse {
+    pub forked_conversation_id: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -557,12 +584,27 @@ pub struct FileArtifactUploadTargetInfo {
     pub url: String,
     pub method: String,
     pub headers: Vec<FileArtifactUploadHeaderInfo>,
+    /// Ordered multipart form fields for presigned POST uploads.
+    pub fields: Vec<UploadField>,
 }
 
 #[derive(Debug, Clone)]
 pub struct CreateFileArtifactUploadResponse {
     pub artifact: FileArtifactRecord,
     pub upload_target: FileArtifactUploadTargetInfo,
+}
+
+/// A single git credential entry returned by `taskGitCredentials`.
+#[derive(Clone)]
+pub struct GitCredential {
+    /// The GitHub token (OAuth user token or App installation token).
+    pub token: String,
+    /// The GitHub username. `None` for service-account (installation token) principals.
+    pub username: Option<String>,
+    /// The GitHub email. `None` for service-account principals.
+    pub email: Option<String>,
+    /// The host (always `"github.com"` in V1).
+    pub host: String,
 }
 
 /// Filter parameters for listing ambient agent tasks.
@@ -736,6 +778,12 @@ pub(crate) fn build_list_agent_runs_url(limit: i32, filter: &TaskListFilter) -> 
 pub(crate) fn build_run_followup_url(run_id: &AmbientAgentTaskId) -> String {
     format!("agent/runs/{run_id}/followups")
 }
+pub(crate) fn build_fork_conversation_url(conversation_id: &str) -> String {
+    format!(
+        "agent/conversations/{}/fork",
+        urlencoding::encode(conversation_id)
+    )
+}
 
 struct ListRunsResponse {
     runs: Vec<AmbientAgentTask>,
@@ -831,6 +879,8 @@ pub trait AIClient: 'static + Send + Sync {
 
     async fn get_feature_model_choices(&self) -> Result<ModelsByFeature, anyhow::Error>;
 
+    async fn get_available_harnesses(&self) -> Result<Vec<HarnessAvailability>, anyhow::Error>;
+
     /// Fetches the free-tier available models without requiring authentication.
     /// Used during pre-login onboarding so logged-out users see an accurate model list
     /// instead of the hard-coded `ModelsByFeature::default()` fallback.
@@ -887,6 +937,13 @@ pub trait AIClient: 'static + Send + Sync {
         &self,
         request: UploadLocalHandoffSnapshotRequest,
     ) -> anyhow::Result<UploadLocalHandoffSnapshotResponse, anyhow::Error>;
+
+    /// Materialize a server-side fork of a conversation.
+    async fn fork_conversation(
+        &self,
+        conversation_id: String,
+        title: Option<String>,
+    ) -> anyhow::Result<ForkConversationResponse, anyhow::Error>;
 
     async fn list_ambient_agent_tasks(
         &self,
@@ -957,6 +1014,12 @@ pub trait AIClient: 'static + Send + Sync {
         &self,
         task_id: &AmbientAgentTaskId,
     ) -> anyhow::Result<(), anyhow::Error>;
+
+    async fn get_task_git_credentials(
+        &self,
+        task_id: String,
+        workload_token: String,
+    ) -> anyhow::Result<Vec<GitCredential>, anyhow::Error>;
 
     async fn get_task_attachments(
         &self,
@@ -1130,6 +1193,34 @@ impl ServerApi {
         let response = response.json::<ReadAgentMessageResponse>().await?;
         Ok(response)
     }
+}
+
+/// Convert a cynic `FileArtifactUploadField` into the shared [`UploadField`]
+/// domain type. Unknown variants bubble as an error rather than being silently
+/// dropped, because a server-provided field we can't represent will almost certainly
+/// cause the upload to fail.
+fn convert_upload_field(
+    field: warp_graphql::mutations::create_file_artifact_upload_target::FileArtifactUploadField,
+) -> anyhow::Result<UploadField> {
+    use warp_graphql::mutations::create_file_artifact_upload_target::FileArtifactUploadFieldValue;
+
+    let value = match field.value {
+        FileArtifactUploadFieldValue::StaticUploadFieldValue(v) => {
+            UploadFieldValue::Static { value: v.value }
+        }
+        FileArtifactUploadFieldValue::ContentCRC32CFieldValue(_) => UploadFieldValue::ContentCrc32C,
+        FileArtifactUploadFieldValue::ContentDataFieldValue(_) => UploadFieldValue::ContentData,
+        FileArtifactUploadFieldValue::Unknown => {
+            return Err(anyhow!(
+                "Unknown UploadFieldValue variant for field '{}'; update client GraphQL types",
+                field.name
+            ));
+        }
+    };
+    Ok(UploadField {
+        name: field.name,
+        value,
+    })
 }
 
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
@@ -1345,6 +1436,42 @@ impl AIClient for ServerApi {
                 workspaces.remove(0).feature_model_choice.try_into()
             }
             _ => Err(anyhow!("Failed to get available feature model choices")),
+        }
+    }
+
+    async fn get_available_harnesses(&self) -> Result<Vec<HarnessAvailability>, anyhow::Error> {
+        let variables = GetAvailableHarnessesVariables {
+            request_context: get_request_context(),
+        };
+        let operation = GetAvailableHarnesses::build(variables);
+        let response = self.send_graphql_request(operation, None).await?;
+
+        match response.user {
+            warp_graphql::queries::get_available_harnesses::UserResult::UserOutput(output) => {
+                Ok(output
+                    .user
+                    .available_harnesses
+                    .harnesses
+                    .into_iter()
+                    .map(|h| HarnessAvailability {
+                        harness: convert_harness(h.harness).into(),
+                        display_name: h.display_name,
+                        enabled: h.enabled,
+                        available_models: h
+                            .available_models
+                            .into_iter()
+                            .map(|m| crate::ai::harness_availability::HarnessModelInfo {
+                                id: m.id.into_inner(),
+                                display_name: m.display_name,
+                                reasoning_level: m.reasoning_level,
+                            })
+                            .collect(),
+                    })
+                    .collect())
+            }
+            warp_graphql::queries::get_available_harnesses::UserResult::Unknown => {
+                Err(anyhow!("Failed to get available harnesses"))
+            }
         }
     }
 
@@ -1580,6 +1707,18 @@ impl AIClient for ServerApi {
     ) -> anyhow::Result<UploadLocalHandoffSnapshotResponse, anyhow::Error> {
         let response: UploadLocalHandoffSnapshotResponse = self
             .post_public_api("agent/handoff/upload-snapshot", &request)
+            .await?;
+        Ok(response)
+    }
+
+    async fn fork_conversation(
+        &self,
+        conversation_id: String,
+        title: Option<String>,
+    ) -> anyhow::Result<ForkConversationResponse, anyhow::Error> {
+        let request = ForkConversationRequest { title };
+        let response: ForkConversationResponse = self
+            .post_public_api(&build_fork_conversation_url(&conversation_id), &request)
             .await?;
         Ok(response)
     }
@@ -1847,6 +1986,44 @@ impl AIClient for ServerApi {
         Ok(())
     }
 
+    async fn get_task_git_credentials(
+        &self,
+        task_id: String,
+        workload_token: String,
+    ) -> anyhow::Result<Vec<GitCredential>, anyhow::Error> {
+        let variables = TaskGitCredentialsVariables {
+            input: TaskGitCredentialsInput {
+                task_id: cynic::Id::new(task_id),
+                workload_token,
+            },
+            request_context: get_request_context(),
+        };
+        let operation = TaskGitCredentials::build(variables);
+        let response = self.send_graphql_request(operation, None).await?;
+
+        match response.task_git_credentials {
+            TaskGitCredentialsResult::TaskGitCredentialsOutput(output) => {
+                let credentials = output
+                    .credentials
+                    .into_iter()
+                    .map(|c| GitCredential {
+                        token: c.token,
+                        username: c.username,
+                        email: c.email,
+                        host: c.host,
+                    })
+                    .collect();
+                Ok(credentials)
+            }
+            TaskGitCredentialsResult::UserFacingError(error) => {
+                Err(anyhow!(get_user_facing_error_message(error)))
+            }
+            TaskGitCredentialsResult::Unknown => {
+                Err(anyhow!("Failed to fetch task git credentials"))
+            }
+        }
+    }
+
     async fn get_task_attachments(
         &self,
         task_id: String,
@@ -1902,20 +2079,28 @@ impl AIClient for ServerApi {
 
         match response.create_file_artifact_upload_target {
             CreateFileArtifactUploadTargetResult::CreateFileArtifactUploadTargetOutput(output) => {
+                let headers = output
+                    .upload_target
+                    .headers
+                    .into_iter()
+                    .map(|header| FileArtifactUploadHeaderInfo {
+                        name: header.name,
+                        value: header.value,
+                    })
+                    .collect();
+                let fields = output
+                    .upload_target
+                    .fields
+                    .into_iter()
+                    .map(convert_upload_field)
+                    .collect::<anyhow::Result<Vec<_>>>()?;
                 Ok(CreateFileArtifactUploadResponse {
                     artifact: into_file_artifact_record(output.artifact),
                     upload_target: FileArtifactUploadTargetInfo {
                         url: output.upload_target.url,
                         method: output.upload_target.method,
-                        headers: output
-                            .upload_target
-                            .headers
-                            .into_iter()
-                            .map(|header| FileArtifactUploadHeaderInfo {
-                                name: header.name,
-                                value: header.value,
-                            })
-                            .collect(),
+                        headers,
+                        fields,
                     },
                 })
             }
@@ -2300,6 +2485,9 @@ impl From<warp_graphql::queries::get_feature_model_choices::LlmModelHost> for LL
             }
             warp_graphql::queries::get_feature_model_choices::LlmModelHost::AwsBedrock => {
                 LLMModelHost::AwsBedrock
+            }
+            warp_graphql::queries::get_feature_model_choices::LlmModelHost::CustomEndpoint => {
+                LLMModelHost::CustomEndpoint
             }
             warp_graphql::queries::get_feature_model_choices::LlmModelHost::Other(value) => {
                 report_error!(anyhow!(
@@ -2738,5 +2926,5 @@ impl StoreClient for ServerApi {
 }
 
 #[cfg(test)]
-#[path = "ai_test.rs"]
+#[path = "ai_tests.rs"]
 mod tests;
