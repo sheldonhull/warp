@@ -1755,6 +1755,11 @@ fn render_groups(
             NeedsMe,
             Running,
             Idle,
+            /// Tabs that have no CLI agent session at all (plain shell).
+            /// Surfaced as a separate section so an "AI session sitting idle"
+            /// stays in IDLE and doesn't get visually equated with a tab that
+            /// never had an agent.
+            Plain,
         }
         let classify = |tab_idx: usize| -> BazingaSec {
             let tab = &workspace.tabs[tab_idx];
@@ -1798,6 +1803,8 @@ fn render_groups(
                     .is_some()
             });
             if has_agent {
+                // Agent attached but no urgent/active status — session is
+                // present and idle, but the user knows an AI is wired in.
                 return BazingaSec::Idle;
             }
             let any_running = pane_group.visible_pane_ids().iter().any(|pid| {
@@ -1809,7 +1816,8 @@ fn render_groups(
             if any_running {
                 BazingaSec::Running
             } else {
-                BazingaSec::Idle
+                // No agent and nothing running — plain shell.
+                BazingaSec::Plain
             }
         };
 
@@ -1839,6 +1847,7 @@ fn render_groups(
                     BazingaSec::NeedsMe => 0u8,
                     BazingaSec::Running => 1,
                     BazingaSec::Idle => 2,
+                    BazingaSec::Plain => 3,
                 },
                 *vidx,
             )
@@ -1848,11 +1857,12 @@ fn render_groups(
         // sidebar reads as a fixed status frame — empty buckets still show
         // their bar at a dim version of the palette color so the structure
         // "lights up" as rows move between buckets.
-        for sec_tag in 0u8..=2 {
+        for sec_tag in 0u8..=3 {
             let sec_enum = match sec_tag {
                 0 => BazingaSec::NeedsMe,
                 1 => BazingaSec::Running,
-                _ => BazingaSec::Idle,
+                2 => BazingaSec::Idle,
+                _ => BazingaSec::Plain,
             };
             let section_rows: Vec<_> = rows
                 .iter()
@@ -1960,7 +1970,8 @@ fn sec_label(sec: u8) -> &'static str {
     match sec {
         0 => "NEEDS ME",
         1 => "RUNNING",
-        _ => "IDLE",
+        2 => "IDLE",
+        _ => "NON-AI",
     }
 }
 fn sec_color(sec: u8, _theme: &WarpTheme) -> ColorU {
@@ -1970,7 +1981,8 @@ fn sec_color(sec: u8, _theme: &WarpTheme) -> ColorU {
     match sec {
         0 => crate::ai::conversation_status_ui::BAZINGA_BLOCKED_COLOR,
         1 => crate::ai::conversation_status_ui::BAZINGA_IN_PROGRESS_COLOR,
-        _ => crate::ai::conversation_status_ui::bazinga_idle_color(),
+        2 => crate::ai::conversation_status_ui::bazinga_idle_color(),
+        _ => crate::ai::conversation_status_ui::BAZINGA_PLAIN_COLOR,
     }
 }
 

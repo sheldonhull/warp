@@ -27,6 +27,11 @@ pub const BAZINGA_ERROR_COLOR: ColorU = ColorU { r: 239, g: 83, b: 80, a: 255 };
 pub const BAZINGA_CANCELLED_COLOR: ColorU = ColorU { r: 122, g: 143, b: 172, a: 255 };
 pub const BAZINGA_SUCCESS_COLOR: ColorU = ColorU { r: 195, g: 232, b: 141, a: 255 };
 pub const BAZINGA_IDLE_COLOR: ColorU = ColorU { r: 99, g: 119, b: 119, a: 255 };
+/// WarpBazinga: section accent for tabs that have no CLI agent session
+/// attached at all (plain shell). Deeper, lower-contrast neutral than
+/// BAZINGA_IDLE_COLOR so an "AI session sitting idle" row reads as more alive
+/// than a tab that never had an agent in the first place.
+pub const BAZINGA_PLAIN_COLOR: ColorU = ColorU { r: 74, g: 80, b: 96, a: 255 };
 
 /// WarpBazinga override: returns the icon + color the bazinga sidebar should use
 /// for a given `ConversationStatus`. Every status is remapped to the bazinga
