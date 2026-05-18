@@ -60,7 +60,8 @@ pkill -f warp-oss 2>/dev/null || true
 sleep 1
 rm -f /tmp/claude/warp-run.log
 mkdir -p /tmp/claude
-TERM=xterm-256color NO_COLOR=1 ./script/run --dont-open 2>&1 | tee /tmp/claude/warp-run.log | tail -3
+TERM=xterm-256color NO_COLOR=1 WARP_COMMON_SKILLS_INSTALL_TARGET=project \\
+  ./script/run --dont-open 2>&1 | tee /tmp/claude/warp-run.log | tail -3
 APP="target/debug/bundle/osx/WarpOss.app"
 CERT="${WARP_DEV_CERT:-Warp Dev}"
 # Re-sign the bundle with a stable dev cert so the designated requirement
