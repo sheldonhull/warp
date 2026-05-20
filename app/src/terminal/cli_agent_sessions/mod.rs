@@ -387,8 +387,14 @@ impl CLIAgentSessionsModel {
             .get_mut(&terminal_view_id)
             .filter(|s| s.agent == agent)
         {
-            // Upgrade existing session with plugin context.
-            session.status = CLIAgentSessionStatus::InProgress;
+            // Upgrade existing session with plugin context. Initial status is
+            // `Idle` — the listener-attach moment doesn't tell us the agent is
+            // doing anything; the next real event (PromptSubmit, ToolComplete,
+            // etc.) will flip it. Previously this was hardcoded to InProgress,
+            // which made fresh sessions stick at RUNNING because the only
+            // events that arrive while the agent sits idle are SessionStart
+            // (no-op) and idle_prompt (promotes only from terminal states).
+            session.status = CLIAgentSessionStatus::Idle;
             session.listener = Some(listener);
             session.plugin_version = plugin_version;
             session.remote_host = remote_host;
@@ -404,7 +410,10 @@ impl CLIAgentSessionsModel {
             terminal_view_id,
             CLIAgentSession {
                 agent,
-                status: CLIAgentSessionStatus::InProgress,
+                // Fresh session starts Idle. The first real event (PromptSubmit
+                // → InProgress, PermissionRequest → Blocked, etc.) will move
+                // it. See the upgrade branch above for the same rationale.
+                status: CLIAgentSessionStatus::Idle,
                 session_context: CLIAgentSessionContext {
                     cwd,
                     project,
