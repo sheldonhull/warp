@@ -2118,18 +2118,23 @@ fn bazinga_terminal_view_status(
     let conv = tv.selected_conversation_status_for_display(app);
     let session = CLIAgentSessionsModel::as_ref(app).session(tv.id());
     let session_status = session.and_then(|s| {
-        if s.listener.is_some() && s.plugin_version.is_some() {
-            // Plugin-reported rich status — authoritative (Blocked, InProgress,
-            // Success, etc. flow through real OSC events from the statusline
-            // plugin).
+        if s.listener.is_some() {
+            // Listener attached — at least one OSC event has been processed for
+            // this session, so `s.status` reflects real plugin signal. Trust it
+            // regardless of `plugin_version` (which only tracks version
+            // negotiation; its absence on a listener-bound session means the
+            // first event wasn't `session_start`, not that the plugin is gone).
+            // Gating on plugin_version here caused idle Claude sessions to
+            // flicker between RUNNING and IDLE as the TUI spinner repainted —
+            // the PTY-wakeup fallback below would oscillate inside the 1500ms
+            // window.
             return Some(s.status.to_conversation_status());
         }
-        // Self-managed agent (no connected plugin): only the "streaming" signal
-        // is reliable — recent burst-confirmed PTY wakeups mean output is being
-        // produced. Past output cannot be classified as Blocked-vs-Idle without
-        // event-level signals (`QuestionAsked` / `PermissionRequest`), so we
-        // fall through to None (Idle) once streaming stops. Install the Warp
-        // Claude Code statusline plugin in this session to get real Blocked.
+        // No listener yet (command-detected session, plugin not installed, or
+        // pre-first-event window). The only reliable signal is recent
+        // burst-confirmed PTY wakeups; Blocked vs Idle can't be inferred
+        // without event-level signals. Install the Warp Claude Code statusline
+        // plugin to upgrade this session to event-driven status.
         match tv.ms_since_last_wakeup() {
             Some(ms) if ms < BAZINGA_AGENT_ACTIVE_WINDOW_MS => Some(ConversationStatus::InProgress),
             _ => None,
@@ -2158,6 +2163,10 @@ fn conversation_status_priority(status: &ConversationStatus) -> u8 {
         ConversationStatus::InProgress => 2,
         ConversationStatus::Cancelled => 1,
         ConversationStatus::Success => 0,
+        // Idle ranks below Success: a brand-new "waiting at prompt" signal
+        // should never visually outrank a just-completed turn, but should
+        // still drop the row into the IDLE bucket cleanly.
+        ConversationStatus::Idle => 0,
     }
 }
 

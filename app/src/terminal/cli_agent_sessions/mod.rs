@@ -21,6 +21,11 @@ pub enum CLIAgentSessionStatus {
     Error { message: Option<String> },
     Cancelled { reason: Option<String> },
     Blocked { message: Option<String> },
+    /// Session has finished its prior turn and is now sitting at the agent
+    /// prompt waiting for the next user input. Reached via the `idle_prompt`
+    /// event, but only promoted from a prior terminal state (`Success`,
+    /// `Cancelled`) — never overrides `InProgress`, `Blocked`, or `Error`.
+    Idle,
 }
 
 impl CLIAgentSessionStatus {
@@ -34,6 +39,7 @@ impl CLIAgentSessionStatus {
             CLIAgentSessionStatus::Blocked { message } => ConversationStatus::Blocked {
                 blocked_action: message.clone().unwrap_or_default(),
             },
+            CLIAgentSessionStatus::Idle => ConversationStatus::Idle,
         }
     }
 }
@@ -237,8 +243,19 @@ impl CLIAgentSession {
                 CLIAgentSessionStatus::InProgress
             }
             // IdlePrompt means the agent is sitting at its prompt waiting for input.
-            // This should not affect status — otherwise it would override Success after a Stop event.
-            CLIAgentEventType::IdlePrompt => return None,
+            // Promote to `Idle` only from a prior terminal state (Success /
+            // Cancelled); never override InProgress, Blocked, or Error — those
+            // represent active or attention-needed states where a follow-up
+            // `idle_prompt` would lie. From a terminal state, transitioning to
+            // `Idle` distinguishes "just-finished a turn" from "sitting at the
+            // prompt waiting for next input" without losing the prior signal
+            // by overwriting Success outright.
+            CLIAgentEventType::IdlePrompt => match self.status {
+                CLIAgentSessionStatus::Success | CLIAgentSessionStatus::Cancelled { .. } => {
+                    CLIAgentSessionStatus::Idle
+                }
+                _ => return None,
+            },
             CLIAgentEventType::SessionStart => {
                 self.plugin_version = event.payload.plugin_version.clone();
                 return None;

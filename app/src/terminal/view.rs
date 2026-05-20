@@ -12752,10 +12752,12 @@ impl TerminalView {
                     CLIAgentSessionStatus::InProgress
                     | CLIAgentSessionStatus::Success
                     | CLIAgentSessionStatus::Error { .. }
-                    | CLIAgentSessionStatus::Cancelled { .. } => {
+                    | CLIAgentSessionStatus::Cancelled { .. }
+                    | CLIAgentSessionStatus::Idle => {
                         // Auto-open rich input when the agent resumes, completes,
-                        // errors out, or is cancelled — all terminal/idle states
-                        // where the user is the next actor.
+                        // errors out, is cancelled, or is sitting idle at its
+                        // prompt — all terminal/idle states where the user is
+                        // the next actor.
                         if !self.has_active_cli_agent_input_session(ctx) {
                             self.open_cli_agent_rich_input(CLIAgentInputEntrypoint::AutoShow, ctx);
                         }

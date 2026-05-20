@@ -251,6 +251,10 @@ fn map_conversation_status(
                 "The agent got stuck waiting for user confirmation on the action: {blocked_action}"
             ))),
         ),
+        // Idle reads to the task-status pipeline as a clean-success terminal
+        // outcome — the prior turn finished, the agent is waiting for next
+        // input. No need to mint a new task-state with its own message.
+        ConversationStatus::Idle => (AgentTaskState::Succeeded, None),
     }
 }
 
@@ -335,6 +339,9 @@ fn map_cli_session_status(
             AgentTaskState::Blocked,
             message.as_ref().map(TaskStatusUpdate::message),
         ),
+        // Idle reads as Succeeded for downstream task tracking; idle_prompt is
+        // a sidebar refinement, not a separate task state.
+        CLIAgentSessionStatus::Idle => (AgentTaskState::Succeeded, None),
     }
 }
 

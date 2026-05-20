@@ -211,6 +211,12 @@ impl AgentNotificationsModel {
                         ctx,
                     );
                 }
+                // Idle is a post-turn waiting state — the agent already
+                // surfaced its Success/Cancelled notification (which produced
+                // a desktop ping). idle_prompt is bookkeeping for the sidebar;
+                // it must not produce another notification or clear the prior
+                // one, otherwise the user loses the "task completed" ping.
+                CLIAgentSessionStatus::Idle => {}
             },
         }
     }
@@ -394,6 +400,10 @@ impl AgentNotificationsModel {
                     ctx,
                 );
             }
+            // Idle is a post-turn waiting state — the agent already produced
+            // its Success/Cancelled notification. idle_prompt is a sidebar
+            // refinement; no separate notification.
+            ConversationStatus::Idle => {}
         }
     }
 

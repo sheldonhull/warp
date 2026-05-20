@@ -51,6 +51,7 @@ pub fn bazinga_status_icon_and_color(
         ConversationStatus::Error => BAZINGA_ERROR_COLOR,
         ConversationStatus::Cancelled => BAZINGA_CANCELLED_COLOR,
         ConversationStatus::Success => BAZINGA_SUCCESS_COLOR,
+        ConversationStatus::Idle => BAZINGA_IDLE_COLOR,
     };
     (icon, color)
 }
@@ -152,6 +153,8 @@ fn status_tint_opacity_pct(status: &ConversationStatus) -> Option<u8> {
     match status {
         ConversationStatus::Blocked { .. } | ConversationStatus::Error => Some(18),
         ConversationStatus::InProgress => Some(18),
-        ConversationStatus::Success | ConversationStatus::Cancelled => None,
+        ConversationStatus::Success
+        | ConversationStatus::Cancelled
+        | ConversationStatus::Idle => None,
     }
 }

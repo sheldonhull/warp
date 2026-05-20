@@ -304,6 +304,10 @@ impl AgentRunDisplayStatus {
             ConversationStatus::Blocked { blocked_action } => Self::ConversationBlocked {
                 blocked_action: blocked_action.clone(),
             },
+            // Idle is a post-turn waiting state; for the conversations model it
+            // reads the same as Succeeded — the prior turn finished, no
+            // outstanding work, the next signal will be a new InProgress.
+            ConversationStatus::Idle => Self::ConversationSucceeded,
         }
     }
 

@@ -2796,7 +2796,8 @@ impl AgentDriver {
                         CLIAgentSessionStatus::Success
                         | CLIAgentSessionStatus::Blocked { .. }
                         | CLIAgentSessionStatus::Error { .. }
-                        | CLIAgentSessionStatus::Cancelled { .. } => {
+                        | CLIAgentSessionStatus::Cancelled { .. }
+                        | CLIAgentSessionStatus::Idle => {
                             // Terminal/idle states: agent isn't actively churning,
                             // so apply the idle-on-complete timer the same way.
                             if let Some(idle_timeout) = me.idle_on_complete {

@@ -240,7 +240,7 @@ echo "✓ removed '$CERT' from login keychain (if present)"
 #   SCENARIO=stop          mise run warp:test:sidebar    # → Success
 #   SCENARIO=error         mise run warp:test:sidebar    # → Error
 #   SCENARIO=cancelled     mise run warp:test:sidebar    # → Cancelled
-#   SCENARIO=idle          mise run warp:test:sidebar    # idle_prompt (no-op confirmation)
+#   SCENARIO=idle          mise run warp:test:sidebar    # → Idle (from Success/Cancelled; else no-op)
 #
 # Transition scenarios (Blocked → ?):
 #   SCENARIO=perm_granted  mise run warp:test:sidebar    # blocked → tool_complete success:true → InProgress
@@ -296,7 +296,7 @@ case "$SCENARIO" in
       "  stop          stop                                           -> Success" \
       "  error         tool_complete success:false                    -> Error" \
       "  cancelled     cancelled                                      -> Cancelled" \
-      "  idle          idle_prompt                                    -> (no-op)" \
+      "  idle          idle_prompt                                    -> Idle (from Success/Cancelled; else no-op)" \
       "" \
       "transitions:" \
       "  perm_granted  blocked -> tool_complete success:true          -> InProgress" \
@@ -320,7 +320,17 @@ case "$SCENARIO" in
   stop)          emit session_start; sleep 0.2; emit stop response:'\"manual stop\"' ;;
   error)         emit session_start; sleep 0.2; emit tool_complete tool_name:'\"Bash\"' summary:'\"failed\"' success:false ;;
   cancelled)     emit session_start; sleep 0.2; emit cancelled reason:'\"prompt_input_exit\"' ;;
-  idle)          emit session_start; sleep 0.2; emit idle_prompt summary:'\"waiting for input\"' ;;
+  idle)
+    # Idle only promotes from a terminal state (Success / Cancelled). Drive
+    # the session through stop first so the follow-up idle_prompt actually
+    # transitions to Idle instead of being a no-op against the default
+    # InProgress that `session_start` registers.
+    emit session_start
+    sleep 0.2
+    emit stop response:'\"setup for idle\"'
+    sleep 0.2
+    emit idle_prompt summary:'\"waiting for input\"'
+    ;;
   perm_granted)
     emit session_start
     sleep 0.2

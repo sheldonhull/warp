@@ -46,7 +46,8 @@ use crate::{
     ai::{
         agent::{
             icons::{
-                failed_icon, gray_stop_icon, in_progress_icon, succeeded_icon, yellow_stop_icon,
+                failed_icon, gray_clock_icon, gray_stop_icon, in_progress_icon, succeeded_icon,
+                yellow_stop_icon,
             },
             todos::AIAgentTodoList,
             AIAgentOutputMessage, AIAgentOutputMessageType, MessageToAIAgentOutputMessageError,
@@ -4034,6 +4035,12 @@ pub enum ConversationStatus {
 
     /// The last turn of the agent resulted in an action whose execution is blocked by the user.
     Blocked { blocked_action: String },
+
+    /// Agent has completed its turn and is sitting at its prompt waiting for the
+    /// next user input. Distinct from `Success` (just-finished a turn) so the
+    /// sidebar can surface "ready for input" without overwriting a prior
+    /// success/cancel signal.
+    Idle,
 }
 
 impl std::fmt::Display for ConversationStatus {
@@ -4044,6 +4051,7 @@ impl std::fmt::Display for ConversationStatus {
             ConversationStatus::Error => write!(f, "Error"),
             ConversationStatus::Cancelled => write!(f, "Cancelled"),
             ConversationStatus::Blocked { .. } => write!(f, "Blocked"),
+            ConversationStatus::Idle => write!(f, "Idle"),
         }
     }
 }
@@ -4056,6 +4064,7 @@ impl ConversationStatus {
             ConversationStatus::Blocked { .. } => yellow_stop_icon(appearance),
             ConversationStatus::Error => failed_icon(appearance),
             ConversationStatus::Cancelled => gray_stop_icon(appearance),
+            ConversationStatus::Idle => gray_clock_icon(appearance),
         }
     }
 
@@ -4094,6 +4103,7 @@ impl ConversationStatus {
                     StatusColorStyle::Cloud => theme.ansi_bg_yellow(),
                 },
             ),
+            ConversationStatus::Idle => (Icon::ClockSnooze, internal_colors::neutral_5(theme)),
         }
     }
 
@@ -4112,12 +4122,19 @@ impl ConversationStatus {
     pub fn is_done(&self) -> bool {
         matches!(
             self,
-            ConversationStatus::Success | ConversationStatus::Error | ConversationStatus::Cancelled
+            ConversationStatus::Success
+                | ConversationStatus::Error
+                | ConversationStatus::Cancelled
+                | ConversationStatus::Idle
         )
     }
 
     pub fn is_error(&self) -> bool {
         matches!(self, ConversationStatus::Error)
+    }
+
+    pub fn is_idle(&self) -> bool {
+        matches!(self, ConversationStatus::Idle)
     }
 }
 

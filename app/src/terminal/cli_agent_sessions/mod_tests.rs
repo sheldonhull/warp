@@ -612,3 +612,94 @@ fn permission_request_still_populates_summary_and_tool_fields() {
         CLIAgentSessionStatus::Blocked { .. },
     ));
 }
+
+fn fresh_claude_session_with_status(status: CLIAgentSessionStatus) -> CLIAgentSession {
+    CLIAgentSession {
+        agent: CLIAgent::Claude,
+        status,
+        session_context: CLIAgentSessionContext::default(),
+        input_state: CLIAgentInputState::Closed,
+        should_auto_toggle_input: false,
+        listener: None,
+        plugin_version: None,
+        draft_text: None,
+        remote_host: None,
+        custom_command_prefix: None,
+    }
+}
+
+fn idle_prompt_event() -> CLIAgentEvent {
+    CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::Claude,
+        event: CLIAgentEventType::IdlePrompt,
+        session_id: Some("abc".to_owned()),
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload {
+            summary: Some("waiting for next prompt".to_owned()),
+            ..Default::default()
+        },
+    }
+}
+
+#[test]
+fn idle_prompt_promotes_success_to_idle() {
+    // Stop → Success → idle_prompt should land on Idle so the sidebar can
+    // distinguish "just-finished a turn" from "sitting at prompt waiting on
+    // the user". Mapped through `to_conversation_status` to keep the test
+    // honest about the public surface.
+    let mut session = fresh_claude_session_with_status(CLIAgentSessionStatus::Success);
+    let new_status = session.apply_event(&idle_prompt_event());
+    assert!(matches!(new_status, Some(CLIAgentSessionStatus::Idle)));
+    assert!(matches!(session.status, CLIAgentSessionStatus::Idle));
+}
+
+#[test]
+fn idle_prompt_promotes_cancelled_to_idle() {
+    let mut session = fresh_claude_session_with_status(CLIAgentSessionStatus::Cancelled {
+        reason: Some("prompt_input_exit".to_owned()),
+    });
+    let new_status = session.apply_event(&idle_prompt_event());
+    assert!(matches!(new_status, Some(CLIAgentSessionStatus::Idle)));
+}
+
+#[test]
+fn idle_prompt_does_not_override_in_progress() {
+    // Active work must not be masked by a stray idle_prompt arriving during a
+    // turn — InProgress stays InProgress, no status change emitted.
+    let mut session = fresh_claude_session_with_status(CLIAgentSessionStatus::InProgress);
+    let new_status = session.apply_event(&idle_prompt_event());
+    assert!(new_status.is_none());
+    assert!(matches!(session.status, CLIAgentSessionStatus::InProgress));
+}
+
+#[test]
+fn idle_prompt_does_not_override_blocked() {
+    let mut session = fresh_claude_session_with_status(CLIAgentSessionStatus::Blocked {
+        message: Some("waiting on permission".to_owned()),
+    });
+    let new_status = session.apply_event(&idle_prompt_event());
+    assert!(new_status.is_none());
+    assert!(matches!(session.status, CLIAgentSessionStatus::Blocked { .. }));
+}
+
+#[test]
+fn idle_prompt_does_not_override_error() {
+    let mut session = fresh_claude_session_with_status(CLIAgentSessionStatus::Error {
+        message: Some("tool exit 1".to_owned()),
+    });
+    let new_status = session.apply_event(&idle_prompt_event());
+    assert!(new_status.is_none());
+    assert!(matches!(session.status, CLIAgentSessionStatus::Error { .. }));
+}
+
+#[test]
+fn idle_prompt_is_noop_from_idle() {
+    // Repeated idle_prompt events while already Idle should not re-emit a
+    // status change (no spam down the StatusChanged channel).
+    let mut session = fresh_claude_session_with_status(CLIAgentSessionStatus::Idle);
+    let new_status = session.apply_event(&idle_prompt_event());
+    assert!(new_status.is_none());
+    assert!(matches!(session.status, CLIAgentSessionStatus::Idle));
+}
