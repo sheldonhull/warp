@@ -703,3 +703,74 @@ fn idle_prompt_is_noop_from_idle() {
     assert!(new_status.is_none());
     assert!(matches!(session.status, CLIAgentSessionStatus::Idle));
 }
+
+fn tool_complete_event(success: bool, summary: &str) -> CLIAgentEvent {
+    CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::Claude,
+        event: CLIAgentEventType::ToolComplete,
+        session_id: Some("abc".to_owned()),
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload {
+            success: Some(success),
+            summary: Some(summary.to_owned()),
+            tool_name: Some("Bash".to_owned()),
+            ..Default::default()
+        },
+    }
+}
+
+fn stop_event() -> CLIAgentEvent {
+    CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::Claude,
+        event: CLIAgentEventType::Stop,
+        session_id: Some("abc".to_owned()),
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload::default(),
+    }
+}
+
+#[test]
+fn tool_failure_mid_task_does_not_change_status() {
+    // A failing tool mid-turn must never flip the session into Error. The
+    // agent often recovers with a text-only response (no follow-up event),
+    // so any deferred surfacing produced false-positive red badges on a
+    // session that had already moved on. Until the protocol gains an
+    // explicit agent-error signal, a failing tool is a non-event for
+    // status purposes when we're already InProgress.
+    let mut session = fresh_claude_session_with_status(CLIAgentSessionStatus::InProgress);
+    let new_status = session.apply_event(&tool_complete_event(false, "exit 1"));
+    assert!(new_status.is_none(), "no status change for mid-task failure");
+    assert!(matches!(session.status, CLIAgentSessionStatus::InProgress));
+}
+
+#[test]
+fn stop_after_tool_failure_is_success() {
+    // Even with no successful follow-up between the failed tool and Stop,
+    // Stop must report Success. Stop carries no agent-error signal in the
+    // current protocol, so treating it as an error produced red badges on
+    // sessions that recovered via a text response we couldn't observe.
+    let mut session = fresh_claude_session_with_status(CLIAgentSessionStatus::InProgress);
+    session.apply_event(&tool_complete_event(false, "exit 1"));
+
+    let new_status = session.apply_event(&stop_event());
+    assert!(matches!(new_status, Some(CLIAgentSessionStatus::Success)));
+    assert!(matches!(session.status, CLIAgentSessionStatus::Success));
+}
+
+#[test]
+fn tool_failure_from_blocked_stays_blocked() {
+    // Permission-blocked sessions must not flip to Error on a tool_complete
+    // failure — the failure may still resolve via subsequent activity, and
+    // pulling the permission UI out from under the user mid-prompt was the
+    // bug this branch removed.
+    let mut session = fresh_claude_session_with_status(CLIAgentSessionStatus::Blocked {
+        message: Some("Wants to run bash".to_owned()),
+    });
+    let new_status = session.apply_event(&tool_complete_event(false, "exit 1"));
+    assert!(new_status.is_none());
+    assert!(matches!(session.status, CLIAgentSessionStatus::Blocked { .. }));
+}

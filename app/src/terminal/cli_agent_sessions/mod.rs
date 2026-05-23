@@ -18,6 +18,12 @@ use event::{CLIAgentEvent, CLIAgentEventType};
 pub enum CLIAgentSessionStatus {
     InProgress,
     Success,
+    /// No event in the current plugin protocol surfaces an agent-side error,
+    /// so this variant is never constructed at runtime today. Kept as the
+    /// landing target for a future protocol addition (e.g. `stop {success:false}`
+    /// or a dedicated `agent_error` event); mapped through to
+    /// `ConversationStatus::Error` so the UI side is already wired.
+    #[allow(dead_code)]
     Error { message: Option<String> },
     Cancelled { reason: Option<String> },
     Blocked { message: Option<String> },
@@ -190,23 +196,21 @@ impl CLIAgentSession {
                 CLIAgentSessionStatus::InProgress
             }
             CLIAgentEventType::ToolComplete => {
+                // Tool failures are non-terminal: the agent may recover via a
+                // text-only response that emits no further events, so the
+                // protocol can't distinguish "recovered" from "gave up" at
+                // Stop time. Surfacing Error here (or deferring it to Stop)
+                // produced false-positive red badges for sessions that had
+                // already moved on. Until the plugin protocol gains an
+                // explicit agent-error signal (e.g. `stop {success:false}`),
+                // a failing tool only matters for clearing the Blocked state.
                 if event.payload.success == Some(false) {
-                    // Tool failed — surface as Error regardless of prior state so
-                    // PostToolUseFailure can transition out of InProgress, Blocked,
-                    // or anything else the session is currently sitting in.
-                    self.clear_permission_scoped_state();
-                    let message = event
-                        .payload
-                        .summary
-                        .clone()
-                        .or_else(|| event.payload.tool_name.clone());
-                    CLIAgentSessionStatus::Error { message }
-                } else {
-                    if !matches!(self.status, CLIAgentSessionStatus::Blocked { .. }) {
-                        return None;
-                    }
-                    CLIAgentSessionStatus::InProgress
+                    return None;
                 }
+                if !matches!(self.status, CLIAgentSessionStatus::Blocked { .. }) {
+                    return None;
+                }
+                CLIAgentSessionStatus::InProgress
             }
             CLIAgentEventType::Cancelled => {
                 self.clear_permission_scoped_state();

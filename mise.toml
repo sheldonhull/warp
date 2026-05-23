@@ -238,14 +238,14 @@ echo "✓ removed '$CERT' from login keychain (if present)"
 #   SCENARIO=blocked       mise run warp:test:sidebar    # → Blocked (NEEDS ME)
 #   SCENARIO=question      mise run warp:test:sidebar    # → Blocked (NEEDS ME)
 #   SCENARIO=stop          mise run warp:test:sidebar    # → Success
-#   SCENARIO=error         mise run warp:test:sidebar    # → Error
+#   SCENARIO=error         mise run warp:test:sidebar    # → (no status; tool_complete success:false is a no-op until protocol gains agent-error signal)
 #   SCENARIO=cancelled     mise run warp:test:sidebar    # → Cancelled
 #   SCENARIO=idle          mise run warp:test:sidebar    # → Idle (from Success/Cancelled; else no-op)
 #
 # Transition scenarios (Blocked → ?):
 #   SCENARIO=perm_granted  mise run warp:test:sidebar    # blocked → tool_complete success:true → InProgress
 #   SCENARIO=perm_replied  mise run warp:test:sidebar    # blocked → permission_replied → InProgress
-#   SCENARIO=recover_error mise run warp:test:sidebar    # error → prompt_submit → InProgress
+#   SCENARIO=recover_error mise run warp:test:sidebar    # (legacy) error path is unreachable today; scenario stays for protocol-future use
 #
 # Sequences:
 #   mise run warp:test:sidebar                           # full walk (default)
@@ -294,7 +294,7 @@ case "$SCENARIO" in
       "  blocked       permission_request                             -> Blocked (NEEDS ME)" \
       "  question      question_asked                                 -> Blocked (NEEDS ME)" \
       "  stop          stop                                           -> Success" \
-      "  error         tool_complete success:false                    -> Error" \
+      "  error         tool_complete success:false                    -> (no-op; protocol lacks agent-error signal)" \
       "  cancelled     cancelled                                      -> Cancelled" \
       "  idle          idle_prompt                                    -> Idle (from Success/Cancelled; else no-op)" \
       "" \
